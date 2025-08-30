@@ -9,13 +9,13 @@ MODEL_PATH = "/home/user/xieqiuhao/multimodel_relation/downloaded_model/GLM-4.1V
 
 # 加载本地图片
 image_path1 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/rgb_img/97.jpg"
-image_path2 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/thermal_img/125.jpg"
+image_path2 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/thermal_img/95.jpg"
 
 prompt = (
-    "现给出一对图片对或者图片-文本对，识别图像目标主体的行动意图和场景，以及图像中各个主体之间的关系或者文本的正文细节内容。"
+    "现给出一对图片对或者图片-文本对，对于图像：识别图像目标主体的行动意图和场景，以及图像中各个主体之间的关系，比如敌军在持枪在逮捕、敌军在森林巡逻等；对于文本：仔细分析文本的正文细节内容，比如时间、地点、人物、事情、经过等。"
     "只依据图片场景意思和文本语义内容，忽略图像不同表现形式（色彩、风格等）以及不同成像技术（可见光、热成像等），"
-    "分析它们之间是什么关系，关系类型分别是关联、因果、等价、矛盾。。"
-    "输出要求：首先给出关系类型判断，然后给出分析。"
+    "分析它们之间是什么关系，关系类型分别是关联、因果、等价、矛盾。"
+    "输出要求：首先给出关系类型判断，然后给出分析,分析过程要忠于输入的图文的识别结果。"
     "注意，1）所有关系的判断忽略表现形式上（如RGB图像-热力图的成像方式）的不同，只关注图像或者文本的表达意思；"
     "2）等价只要求图片场景内容的意思或文本表达的意思相同即可；"
     "3）矛盾关系不关注格式、色彩、成像方式，只关注图像场景内容或者文本语义内容之间是否存在语义上的矛盾关系，比如二者同时某个主体都存在，但同一主体所在的场景或者做的事情不同，"
@@ -25,7 +25,7 @@ prompt = (
 
 # 可选文本；如无则仅图片+提示词
 text = None
-text = "密级：秘密  等级：紧急  时间：2023年5月10日  发报：军情局  收报：前线指挥部  抄送：各相关部门  主题：观察报告  正文：  敌方全部人员正在城市中休整"
+# text = "密级：秘密  等级：紧急  时间：2023年5月10日  发报：军情局  收报：前线指挥部  抄送：各相关部门  主题：观察报告  正文：  敌方全部人员正在城市中休整"
 
 def build_initial_messages(image1: Image.Image, image2: Image.Image, prompt_text: str, extra_text: str | None):
     if extra_text:
@@ -35,7 +35,7 @@ def build_initial_messages(image1: Image.Image, image2: Image.Image, prompt_text
             "role": "user",
             "content": [
                 {"type": "image", "image": image1},
-                # {"type": "image", "image": image2},
+                {"type": "image", "image": image2},
                 {"type": "text", "text": prompt_text},
             ],
         }
