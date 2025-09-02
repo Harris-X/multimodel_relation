@@ -48,7 +48,21 @@ def build_initial_messages(image1: Image.Image, image2: Image.Image, prompt_text
         },
     ]
 
-def chat(image1:str, image2:str, text:str, eval:bool=True):
+def load_model():
+    # 加载模型与处理器
+    processor = AutoProcessor.from_pretrained(MODEL_PATH, use_fast=True)
+    # 尝试优先bf16，失败则退回fp16
+    dtype = torch.bfloat16
+    if not torch.cuda.is_available():
+        dtype = torch.float32
+    model = Glm4vForConditionalGeneration.from_pretrained(
+        pretrained_model_name_or_path=MODEL_PATH,
+        torch_dtype=dtype,
+        device_map="auto",
+    )
+    return processor, model
+
+def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
     # 加载图片
     image1 = Image.open(image1).convert("RGB")
     image2 = Image.open(image2).convert("RGB")
@@ -392,7 +406,7 @@ def eval():
     header = ["id", "rgb_file", "infrared_file", "desc_file",
               "gt_label", "gt_error", "pred_label", "pred_error",
               "label_correct", "error_correct"]
-
+    processor, model = load_model()
     # 评测前N个（这里示例取全部）
     num = len(common_ids)
     for i in range(num):
@@ -410,7 +424,7 @@ def eval():
             continue
 
         text = json_data.get("msg", "")
-        response = chat(img1, img2, text)
+        response = chat(img1, img2, text, processor, model)
         result = check_answer(response, json_data)
 
         print(f"样本 {sid} 结果: {result}")
