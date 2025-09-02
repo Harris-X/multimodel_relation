@@ -9,9 +9,9 @@ import re
 
 MODEL_PATH = "/home/user/xieqiuhao/multimodel_relation/downloaded_model/GLM-4.1V-9B-Thinking"
 
-# 加载本地图片
-image_path1 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/rgb_img/3.jpg"
-image_path2 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/thermal_img/3.jpg"
+# # 加载本地图片
+# image_path1 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/rgb_img/3.jpg"
+# image_path2 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/thermal_img/3.jpg"
 
 prompt = (
     "现给出一对军事领域的图片（图片1、图片2）以及一段军事文本（文本1）,"
@@ -29,8 +29,8 @@ prompt = (
 )
 
 # 可选文本；如无则仅图片+提示词
-text = None
-text = "密级：秘密  等级：紧急  时间：2023年5月10日  发报：军情局  收报：前线指挥部  抄送：各相关部门  主题：观察报告  正文：敌方坦克不在战场上"
+# text = None
+# text = "密级：秘密  等级：紧急  时间：2023年5月10日  发报：军情局  收报：前线指挥部  抄送：各相关部门  主题：观察报告  正文：敌方坦克不在战场上"
 
 def build_initial_messages(image1: Image.Image, image2: Image.Image, prompt_text: str, extra_text: str | None):
     if extra_text:
@@ -46,7 +46,7 @@ def build_initial_messages(image1: Image.Image, image2: Image.Image, prompt_text
         },
     ]
 
-def chat(image1:str=image_path1, image2:str=image_path2, text:str=text, eval:bool=False):
+def chat(image1:str, image2:str, text:str, eval:bool=True):
     # 加载图片
     image1 = Image.open(image1).convert("RGB")
     image2 = Image.open(image2).convert("RGB")
@@ -259,7 +259,7 @@ def determine_contradiction(data: dict) -> dict:
     return result
 
 
-def check_answer(response: str, ground_truth: dict, error:str) -> bool:
+def check_answer(response: str, ground_truth: dict) -> bool:
     dict_response = check_label_re(response)
     dict_response_answers = dict_response["relationships"]
     response_answers = dict_response_answers[3]
@@ -306,22 +306,48 @@ def read_json_file(file_path):
     
     return None
 
+def _natural_sort_key(s: str):
+    # 自然排序：按文件名中的数字顺序排序（先去扩展名）
+    s = os.path.splitext(s)[0]
+    return [int(p) if p.isdigit() else p for p in re.split(r'(\d+)', s)]
+
+def _build_stem_map(dir_path: str) -> dict:
+    # 构建 {去扩展名: 文件名} 映射，便于按公共ID对齐
+    files = [f for f in os.listdir(dir_path) if not f.startswith('.')]
+    return {os.path.splitext(f)[0]: f for f in files}
+
 def eval():
     base_datadir = r"/home/user/xieqiuhao/multimodel_relation/data_with_label/"
-    rgb_img = os.listdir(os.path.join(base_datadir, "rgb_img"))
-    infrared_img = os.listdir(os.path.join(base_datadir, "infrared_img"))
-    description = os.listdir(os.path.join(base_datadir, "description"))
-    for i in range(1):
-        img1 = os.path.join(base_datadir,"rgb_img",rgb_img[i])
-        img2 = os.path.join(base_datadir,"infrared_img",infrared_img[i])
-        text = os.path.join(base_datadir,"description",description[i])
-        json_data = read_json_file(text)
-        text =  json_data["msg"]
-        label = json_data["label"]
-        error = json_data["error"]
-        response = chat(img1,img2,text)
-        is_correct = check_answer(response, label, error)
-        print(is_correct)
+    rgb_dir = os.path.join(base_datadir, "rgb_img")
+    ir_dir = os.path.join(base_datadir, "infrared_img")
+    desc_dir = os.path.join(base_datadir, "description")
+
+    rgb_map = _build_stem_map(rgb_dir)
+    ir_map = _build_stem_map(ir_dir)
+    desc_map = _build_stem_map(desc_dir)
+
+    # 取三者公共ID并做自然排序，保证一一对应
+    common_ids = sorted(set(rgb_map) & set(ir_map) & set(desc_map), key=_natural_sort_key)
+    if not common_ids:
+        print("未找到三者共同的样本ID，请检查文件名是否对应。")
+        return
+
+    # 评测前N个（这里示例取1个）
+    num = min(1, len(common_ids))
+    for i in range(num):
+        sid = common_ids[i]
+        img1 = os.path.join(rgb_dir, rgb_map[sid])
+        img2 = os.path.join(ir_dir, ir_map[sid])
+        text_path = os.path.join(desc_dir, desc_map[sid])
+
+        json_data = read_json_file(text_path)
+        if json_data is None:
+            continue
+
+        text = json_data["msg"]
+        response = chat(img1, img2, text)
+        is_correct = check_answer(response, json_data)
+        print(f"样本 {sid} 结果: {is_correct}")
 
 
 
