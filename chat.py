@@ -319,10 +319,10 @@ def check_answer(response: str, ground_truth: dict) -> dict:
     check_truth = {}
     # 记录预测标签
     check_truth["pred_label"] = response_label
-    check_truth["label"] = (response_label == ground_truth.get("label"))
+    check_truth["label"] = (response_label[:2] == ground_truth.get("label"))
 
     # 判断矛盾模态（仅当标注提供 error）
-    if ground_truth.get("error") != "None":
+    if ground_truth.get("error") != None:
         filter_ans = determine_contradiction(dict_response)
         # 取“图像/文本”前缀的两个字
         cm = filter_ans.get("contradict_modality")
