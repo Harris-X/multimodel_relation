@@ -6,6 +6,7 @@ from transformers import AutoProcessor, Glm4vForConditionalGeneration
 import torch
 from PIL import Image
 import re
+import csv  # 新增
 
 MODEL_PATH = "/home/user/xieqiuhao/multimodel_relation/downloaded_model/GLM-4.1V-9B-Thinking"
 
@@ -287,7 +288,7 @@ def determine_contradiction(data: dict) -> dict:
     return result
 
 
-def check_answer(response: str, ground_truth: dict) -> bool:
+def check_answer(response: str, ground_truth: dict) -> dict:
     dict_response = check_label_re(response)
     rels = dict_response.get("relationships", [])
 
@@ -314,6 +315,8 @@ def check_answer(response: str, ground_truth: dict) -> bool:
         response_label = triple["type"]
 
     check_truth = {}
+    # 记录预测标签
+    check_truth["pred_label"] = response_label
     check_truth["label"] = (response_label == ground_truth.get("label"))
 
     # 判断矛盾模态（仅当标注提供 error）
@@ -322,8 +325,10 @@ def check_answer(response: str, ground_truth: dict) -> bool:
         # 取“图像/文本”前缀的两个字
         cm = filter_ans.get("contradict_modality")
         error = cm[:2] if cm else None
+        check_truth["pred_error"] = error
         check_truth["error"] = (error == ground_truth.get("error"))
     else:
+        check_truth["pred_error"] = None
         check_truth["error"] = None
 
     return check_truth 
@@ -383,22 +388,54 @@ def eval():
         print("未找到三者共同的样本ID，请检查文件名是否对应。")
         return
 
-    # 评测前N个（这里示例取1个）
-    num = min(1, len(common_ids))
+    rows = []
+    header = ["id", "rgb_file", "infrared_file", "desc_file",
+              "gt_label", "gt_error", "pred_label", "pred_error",
+              "label_correct", "error_correct"]
+
+    # 评测前N个（这里示例取全部）
+    num = len(common_ids)
     for i in range(num):
         sid = common_ids[i]
-        img1 = os.path.join(rgb_dir, rgb_map[sid])
-        img2 = os.path.join(ir_dir, ir_map[sid])
-        text_path = os.path.join(desc_dir, desc_map[sid])
+        rgb_file = rgb_map[sid]
+        ir_file = ir_map[sid]
+        desc_file = desc_map[sid]
+
+        img1 = os.path.join(rgb_dir, rgb_file)
+        img2 = os.path.join(ir_dir, ir_file)
+        text_path = os.path.join(desc_dir, desc_file)
 
         json_data = read_json_file(text_path)
         if json_data is None:
             continue
 
-        text = json_data["msg"]
+        text = json_data.get("msg", "")
         response = chat(img1, img2, text)
-        is_correct = check_answer(response, json_data)
-        print(f"样本 {sid} 结果: {is_correct}")
+        result = check_answer(response, json_data)
+
+        print(f"样本 {sid} 结果: {result}")
+
+        rows.append([
+            sid,
+            rgb_file,
+            ir_file,
+            desc_file,
+            json_data.get("label"),
+            json_data.get("error"),
+            result.get("pred_label"),
+            result.get("pred_error"),
+            result.get("label"),
+            result.get("error"),
+        ])
+
+    out_csv = os.path.join(base_datadir, "eval_results.csv")
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    with open(out_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+    print(f"评测结果已保存: {out_csv}")
 
 
 
