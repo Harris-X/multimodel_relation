@@ -70,18 +70,6 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
     # 初始化多轮消息（首轮带图）
     messages = build_initial_messages(image1, image2, prompt, text)
 
-    # 加载模型与处理器
-    processor = AutoProcessor.from_pretrained(MODEL_PATH, use_fast=True)
-    # 尝试优先bf16，失败则退回fp16
-    dtype = torch.bfloat16
-    if not torch.cuda.is_available():
-        dtype = torch.float32
-    model = Glm4vForConditionalGeneration.from_pretrained(
-        pretrained_model_name_or_path=MODEL_PATH,
-        torch_dtype=dtype,
-        device_map="auto",
-    )
-
     def generate_and_print(current_messages: list[dict], max_new_tokens: int = 1024):
         inputs = processor.apply_chat_template(
             current_messages,
