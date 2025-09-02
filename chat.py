@@ -131,28 +131,55 @@ def extract_first_paragraph_after_answer(s: str) -> str:
 def check_label_re(response:str):
     first_para = extract_first_paragraph_after_answer(response)
 
-    # 1) 关系提取（保持之前的正则）
-    relation_pattern = re.compile(r'([\w\u4e00-\u9fa5-]+?)(?:存在|三者关系为)([\u4e00-\u9fa5]+)关系')
+    # 统一破折号/全角横线为半角-
+    norm_text = first_para.replace('—', '-').replace('－', '-').replace('–', '-')
 
-    # 2) 结论提取（保持之前的正则）
-    conclusion_pattern = re.compile(r'实际情况[，,：:\s]*(.*)')
+    # 实体：图片/图像/文本 + 可含空格的编号；连接符允许两侧空格
+    ENTITY = r'(?:图像|图片|文本)\s*\d+'
+    SEP = r'\s*-\s*'
+
+    # 1) 成对关系：X - Y 存在 R 关系
+    pair_pattern = re.compile(
+        rf'({ENTITY}){SEP}({ENTITY})\s*(?:存在)\s*([\u4e00-\u9fa5]+)\s*关系'
+    )
+
+    # 2) 三者关系：X - Y - Z 三者关系为 R（也兼容 总关系为 / 整体关系为）
+    triple_pattern = re.compile(
+        rf'({ENTITY}){SEP}({ENTITY}){SEP}({ENTITY})\s*(?:三者关系为|总关系为|整体关系为)\s*([\u4e00-\u9fa5]+)'
+    )
+
+    # 3) 结论提取（兼容“实际情况预测/综合判断”）
+    conclusion_pattern = re.compile(r'实际情况(?:预测|综合判断)?[，,：:\s]*(.*)')
 
     result = {
         "relationships": [],
         "conclusion": None
     }
 
-    # 在第一段上执行提取
-    for entities_str, relation_type in relation_pattern.findall(first_para):
-        entities = [e for e in entities_str.split('-') if e]
+    # 成对关系
+    for a, b, rtype in pair_pattern.findall(norm_text):
+        a = re.sub(r'\s+', '', a)  # 去空格：图片1、文本1 等
+        b = re.sub(r'\s+', '', b)
         result["relationships"].append({
-            "entities": entities,
-            "type": relation_type
+            "entities": [a, b],
+            "type": rtype
         })
 
-    m = conclusion_pattern.search(first_para)
+    # 三者关系
+    for a, b, c, rtype in triple_pattern.findall(norm_text):
+        a = re.sub(r'\s+', '', a)
+        b = re.sub(r'\s+', '', b)
+        c = re.sub(r'\s+', '', c)
+        result["relationships"].append({
+            "entities": [a, b, c],
+            "type": rtype
+        })
+
+    # 结论
+    m = conclusion_pattern.search(norm_text)
     if m:
         result["conclusion"] = m.group(1).strip()
+
     return result
 
 
@@ -261,20 +288,43 @@ def determine_contradiction(data: dict) -> dict:
 
 def check_answer(response: str, ground_truth: dict) -> bool:
     dict_response = check_label_re(response)
-    dict_response_answers = dict_response["relationships"]
-    response_answers = dict_response_answers[3]
-    response_answers = response_answers["type"]
-    
-    check_truth = dict()
-    check_truth["label"] = True if response_answers == ground_truth["label"] else False
-    if ground_truth["error"] != "null":
-        filter_ans = determine_contradiction(dict_response)
-        error = filter_ans["contradict_modality"][:2]
-        if error == ground_truth["error"]:
-            check_truth["error"] = True
+    rels = dict_response.get("relationships", [])
+
+    # 优先找三者关系
+    triple = next((r for r in rels if len(r.get("entities", [])) == 3), None)
+
+    # 若缺失三者关系，基于成对关系回退一个总关系
+    if triple is None:
+        # 简单回退规则：有矛盾→矛盾；否则按优先级 因果 > 等价 > 关联 选最高
+        pairs = [r for r in rels if len(r.get("entities", [])) == 2]
+        types = [r["type"] for r in pairs]
+        if "矛盾" in types:
+            inferred = "矛盾"
+        elif "因果" in types:
+            inferred = "因果"
+        elif "等价" in types:
+            inferred = "等价"
+        elif "关联" in types:
+            inferred = "关联"
         else:
-            check_truth["error"] = False
-    
+            inferred = None
+        response_label = inferred
+    else:
+        response_label = triple["type"]
+
+    check_truth = {}
+    check_truth["label"] = (response_label == ground_truth.get("label"))
+
+    # 判断矛盾模态（仅当标注提供 error）
+    if ground_truth.get("error") != "null":
+        filter_ans = determine_contradiction(dict_response)
+        # 取“图像/文本”前缀的两个字
+        cm = filter_ans.get("contradict_modality")
+        error = cm[:2] if cm else None
+        check_truth["error"] = (error == ground_truth.get("error"))
+    else:
+        check_truth["error"] = None
+
     return check_truth 
 
 def read_json_file(file_path):
