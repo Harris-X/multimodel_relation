@@ -277,31 +277,54 @@ def check_answer(response: str, ground_truth: dict, error:str) -> bool:
     
     return check_truth 
 
+def read_json_file(file_path):
+    """
+    读取JSON文件并返回解析后的数据
+    
+    参数:
+        file_path (str): JSON文件的路径
+        
+    返回:
+        dict/list: 解析后的JSON数据，如果出错则返回None
+    """
+    try:
+        # 打开并读取JSON文件
+        with open(file_path, 'r', encoding='utf-8') as file:
+            # 解析JSON数据
+            data = json.load(file)
+            print(f"成功读取JSON文件: {file_path}")
+            return data
+            
+    except FileNotFoundError:
+        print(f"错误: 文件 '{file_path}' 不存在")
+    except json.JSONDecodeError:
+        print(f"错误: 文件 '{file_path}' 不是有效的JSON格式")
+    except PermissionError:
+        print(f"错误: 没有权限读取文件 '{file_path}'")
+    except Exception as e:
+        print(f"读取文件时发生错误: {str(e)}")
+    
+    return None
 
 def eval():
     base_datadir = r"/home/user/xieqiuhao/multimodel_relation/data_with_label/"
     rgb_img = os.listdir(os.path.join(base_datadir, "rgb_img"))
     infrared_img = os.listdir(os.path.join(base_datadir, "infrared_img"))
     description = os.listdir(os.path.join(base_datadir, "description"))
-    for i in range(len(description)):
-        img1 = rgb_img[i]
-        img2 = infrared_img[i]
-        text = description[i]
-        text =  json.dumps(text)["msg"]
-        label = json.dumps(text)["label"]
-        error = json.dumps(text)["error"]
+    for i in range(1):
+        img1 = os.path.join(base_datadir,"rgb_img",rgb_img[i])
+        img2 = os.path.join(base_datadir,"infrared_img",infrared_img[i])
+        text = os.path.join(base_datadir,"description",description[i])
+        json_data = read_json_file(text)
+        text =  json_data["msg"]
+        label = json_data["label"]
+        error = json_data["error"]
         response = chat(img1,img2,text)
         is_correct = check_answer(response, label, error)
+        print(is_correct)
 
 
-
-        
-        
-
-
-
-    pass
 
 if __name__ == "__main__":
-    chat(image_path1,image_path2,text)
-    # eval()
+    # chat(image_path1,image_path2,text)
+    eval()
