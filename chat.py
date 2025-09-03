@@ -29,7 +29,8 @@ prompt = (
     "3.1）矛盾关系要注意主体的数量问题，比如图片1显示只有2辆坦克，图片2也显示只有2辆坦克，而文本却说只有1辆坦克。或者因绝对化语气（形容词、修饰词、量词等）比如人数量词等导致场景变换、行动意图、行动方式、与人员数量冲突等；"
     "3.2）矛盾关系要注意修饰词的变换问题，比如说图片1、2分别显示坦克在开炮，但文本显示战场安静静谧，未发现敌军踪迹。图片是坦克正在开炮，而文本却显示战场安静，形容不对，事实不符，因而矛盾。"
     "4）关联关系的区分需要注意描绘范围的词，例如：图像1、2分别展示了一辆敌方坦克车辆处于燃烧状态，而文本1显示敌方装甲车被击毁，敌方装甲部队受到打击。范围从”一辆“坦克被击毁到敌方装甲部队受到打击，文本1的表达不局限在图片1、2内容上，因此是关联关系。"
-    "5）所有的数据都假设是对敌方的记录，不包含本方相关场景、文本的记录。"
+    "5）因果关系要注意，图片1、图片2分别显示的内容是否与文本1所显示的内容成因果关系，文本1是否是图片1/2的原因，或者图片1/2是否是文本1的原因。"
+    "6）所有的数据都假设是对敌方的记录，不包含本方相关场景、文本的记录。"
 )
 
 # 可选文本；如无则仅图片+提示词
@@ -392,14 +393,31 @@ def eval():
         print("未找到三者共同的样本ID，请检查文件名是否对应。")
         return
 
-    rows = []
-    header = ["id", "rgb_file", "infrared_file", "desc_file",
-              "gt_label", "gt_error", "pred_label", "pred_error",
-              "label_correct", "error_correct"]
+    # 输出CSV与日志目录
+    out_csv = os.path.join(base_datadir, "eval_results.csv")
+    log_dir = os.path.join(base_datadir, "eval_logs")
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    header = [
+        "id", "rgb_file", "infrared_file", "desc_file",
+        "gt_label", "gt_error", "pred_label", "pred_error",
+        "label_correct", "error_correct",
+        "model_output"  # 新增：记录模型原始输出
+    ]
+
+    # 若CSV不存在或为空，则先写表头
+    need_header = (not os.path.exists(out_csv)) or (os.path.getsize(out_csv) == 0)
+    if need_header:
+        with open(out_csv, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+
     processor, model = load_model()
-    # 评测前N个（这里示例取全部）
+
+    # 评测范围（保留你原来的起始下标）
     num = len(common_ids)
-    for i in range(num):
+    for i in range(9, num):
         sid = common_ids[i]
         rgb_file = rgb_map[sid]
         ir_file = ir_map[sid]
@@ -417,9 +435,18 @@ def eval():
         response = chat(img1, img2, text, processor, model)
         result = check_answer(response, json_data)
 
-        print(f"样本 {sid} 结果: {result}")
+        # 1) 模型原始输出写入独立日志（每个样本一个txt，及时写入）
+        log_path = os.path.join(log_dir, f"{sid}.txt")
+        try:
+            with open(log_path, "w", encoding="utf-8") as lf:
+                lf.write(response)
+        except Exception as e:
+            print(f"写入日志失败 {log_path}: {e}")
 
-        rows.append([
+        # 2) 将该样本评测结果立即追加写入CSV
+        #    为避免多行文本破坏CSV行结构，这里将换行替换为 \n
+        model_out_for_csv = response.replace("\r\n", "\n").replace("\n", r"\n")
+        row = [
             sid,
             rgb_file,
             ir_file,
@@ -430,16 +457,19 @@ def eval():
             result.get("pred_error"),
             result.get("label"),
             result.get("error"),
-        ])
+            model_out_for_csv,
+        ]
+        try:
+            with open(out_csv, "a", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+                f.flush()
+        except Exception as e:
+            print(f"写入CSV失败 {out_csv}: {e}")
 
-    out_csv = os.path.join(base_datadir, "eval_results.csv")
-    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(rows)
+        print(f"样本 {sid} 结果已记录到CSV与日志。")
 
-    print(f"评测结果已保存: {out_csv}")
+    print(f"评测完成。CSV: {out_csv}  日志目录: {log_dir}")
 
 
 
