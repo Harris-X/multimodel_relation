@@ -22,7 +22,7 @@ prompt = (
     "输出要求：首先给出三对关系类型，后结合这三对关系给出总关系的判定，然后给出分析，分析过程首先要说明图片/文本的具体内容，然后分析之间的关系。"
     "输出注意：如果其中一对图像对/图像-文本对被判断为矛盾关系时（不包括其他的关系），在原本的输出要求的后面（即为输出三对关系类型后面），输出对三者关系（分别对应图像1-图像2，图像1-文本1，图像2-文本1）中哪俩种是最相关联的判断，并输出是哪个模态表达的信息与其他俩个模态表达的信息相斥（如文本1表达的内容与图像1和图像2表达内容相斥），然后接着回答的开头输出对这俩种综合得到的事实。"
     "例如，当图像1识别出存在释放尾气的装甲坦克在行进，图像2识别出无尾气热力图的装甲坦克在行进，文本识别出充气式的坦克伪装成装甲坦克来混淆视听，则输出：图片1-图片2存在矛盾关系，图片2-文本1存在等价关系，图片1-文本1存在矛盾关系，图像1-图像2-文本1三者关系为矛盾关系，其中文本1表达的内容与图像1和图像2表达内容相斥，实际情况预测：敌方使用的是充气坦克。相应的图片/文本分析。"
-    "<think>关系判断时注意，1）所有关系的判断忽略表现形式上（如RGB图像-热力图的成像方式）的不同，只关注图像或者文本的表达意思；"
+    "关系判断时注意，1）所有关系的判断忽略表现形式上（如RGB图像-热力图的成像方式）的不同，只关注图像或者文本的表达意思；"
     "2）关联关系与等价关系需要区分，关联关系需要注意描绘范围的词（形容词、修饰词等），例如：图像1、2分别展示了一辆敌方坦克车辆处于燃烧状态，而文本1显示敌方装甲车被击毁，“敌方装甲部队受到打击”。范围从“一辆坦克”被击毁到“敌方装甲部队”受到打击，文本1的表达相比图片1、2内容上“更多”，因此是关联关系。"
     "3）等价只要求图片对场景内容的意思（如图像1-图像2主体内容相同，场景相同，即为等价）或图片-文本对（图像1-文本1，图像2-文本1）表达的意思相同、不存在额外的扩展即可（例如图像1表达的预测是”1辆“坦克在行径，周围有周围有树木、地形，车辆旁有烟雾，而文本1表达是敌方坦克在行进，因此可以判断这段关系是等价关系，此处只要主体内容一致，不存在某一模态的内容扩展，即为等价关系）；"
     "3.1)对于图片1-图片2-文本1的等价关系的判断，若三对关系都是等价的或者其中2对关系是等价的，即可判断图片1-图片2-文本1之间的关系是等价关系；"
@@ -31,7 +31,7 @@ prompt = (
     "4.2）矛盾关系要注意补充对图像文本的主体修饰词“敌军”，并考虑修饰词的同义词及结论是否一致，例如图片1、2分别显示出存在一个侦察小组在行进，但文本1显示战场安静静谧，未发现敌军踪迹。图片是一个侦察小组在行军（结论敌方侦察小组正在行军），而文本却显示战场安静（结论敌方未进攻），修饰词不对，事实不符，因而矛盾。"
     "5）因果关系要注意时间顺序（即描述事实、和事情发生后之间为因果关系）和因果顺序（即到底是哪个模态是原因，哪个模态是结果）。"
     "5.1）因果关系分析可以通过其中2对关系是因果关系，一对是等价关系来判断出图片1-图片2-文本1是因果关系。例如：图像1、2显示是“被导弹轰炸后的场景”-时间“在后”，而文本1显示的是“我发对敌方进行了轰炸”-时间“在前”，因此文本1是原因，图片1-文本1、图片2-文本1构成因果，图片1-图片2构成等价/关联关系，图片1-图片2-文本1是因果关系。"
-    "6）所有的数据（图片1、图片2、文本1）都是对敌方的记录，不包含本方相关场景、文本的记录。注意图片1、图片2、文本1的主体和形容词的同义词，例如“坦克/装甲车”与“工程车”（坦克、装甲车都属于工程车）、“草地/森林”与“植被”（草地、森林等也属于植被）等</think>"
+    "6）所有的数据（图片1、图片2、文本1）都是对敌方的记录，不包含本方相关场景、文本的记录。注意图片1、图片2、文本1的主体和形容词的同义词，例如“坦克/装甲车”与“工程车”（坦克、装甲车都属于工程车）、“草地/森林”与“植被”（草地、森林等也属于植被）等。"
     "最后要求分析中都采用肯定语气，不使用“若、可能、也许、或许”等表示不确定的同义词。"
 )
 
@@ -123,19 +123,15 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
     return first_reply
 
 def extract_first_paragraph_after_answer(s: str) -> str:
-    # 提取 <answer> ... </answer> 中内容（若无则返回原文）
     m = re.search(r'<answer>(.*?)(?:</answer>|$)', s, flags=re.S)
     block = m.group(1).strip() if m else s.strip()
     if not block:
         return block
-    # 优先在“分析过程”前截断，视为第一段
     p = re.search(r'分析过程', block)
     if p:
         return block[:p.start()].strip()
-    # 否则按空行分段，取第一段
     parts = re.split(r'\n\s*\n', block, maxsplit=1)
     return parts[0].strip()
-
 
 def check_label_re(response:str):
     first_para = extract_first_paragraph_after_answer(response)
@@ -147,14 +143,30 @@ def check_label_re(response:str):
     ENTITY = r'(?:图像|图片|文本)\s*\d+'
     SEP = r'\s*-\s*'
 
+    # 关系类型标准化
+    def _normalize_rel_type(t: str) -> str:
+        t = (t or "").strip()
+        # 去末尾标点与“关系”后缀
+        t = re.sub(r'[。；;，,！!？?\s]+$', '', t)
+        t = re.sub(r'关系$', '', t)
+        # 同义词归一
+        synonyms = {
+            "相同": "等价", "一致": "等价", "相符": "等价",
+            "相关": "关联", "联系": "关联",
+            "冲突": "矛盾", "相斥": "矛盾", "相悖": "矛盾", "相矛盾": "矛盾"
+        }
+        return synonyms.get(t, t)
+
     # 1) 成对关系：X - Y 存在 R 关系
     pair_pattern = re.compile(
         rf'({ENTITY}){SEP}({ENTITY})\s*(?:存在)\s*([\u4e00-\u9fa5]+)\s*关系'
     )
 
-    # 2) 三者关系：X - Y - Z 三者关系为 R（也兼容 总关系为 / 整体关系为）
+    # 2) 三者关系：X - Y - Z 三者关系为 R（兼容 总关系为 / 整体关系为；R 后可带“关系”）
     triple_pattern = re.compile(
-        rf'({ENTITY}){SEP}({ENTITY}){SEP}({ENTITY})\s*(?:三者关系为|总关系为|整体关系为)\s*([\u4e00-\u9fa5]+)'
+        rf'({ENTITY}){SEP}({ENTITY}){SEP}({ENTITY})\s*'
+        rf'(?:三者关系为|总关系为|整体关系为)\s*'
+        rf'([\u4e00-\u9fa5]+)(?:关系)?'
     )
 
     # 3) 结论提取（兼容“实际情况预测/综合判断”）
@@ -169,6 +181,7 @@ def check_label_re(response:str):
     for a, b, rtype in pair_pattern.findall(norm_text):
         a = re.sub(r'\s+', '', a)  # 去空格：图片1、文本1 等
         b = re.sub(r'\s+', '', b)
+        rtype = _normalize_rel_type(rtype)
         result["relationships"].append({
             "entities": [a, b],
             "type": rtype
@@ -179,6 +192,7 @@ def check_label_re(response:str):
         a = re.sub(r'\s+', '', a)
         b = re.sub(r'\s+', '', b)
         c = re.sub(r'\s+', '', c)
+        rtype = _normalize_rel_type(rtype)
         result["relationships"].append({
             "entities": [a, b, c],
             "type": rtype
@@ -321,15 +335,27 @@ def check_answer(response: str, ground_truth: dict) -> dict:
     else:
         response_label = triple["type"]
 
+    # 标签归一比较（防止 None 与带“关系”的写法）
+    def _norm_label_short(x: str | None) -> str | None:
+        if not x:
+            return None
+        x = x.strip()
+        x = re.sub(r'关系$', '', x)
+        # 取前两字且限定到四类
+        x2 = x[:2]
+        return x2 if x2 in {"关联", "因果", "等价", "矛盾"} else None
+
+    gt_label = _norm_label_short(ground_truth.get("label"))
+    pr_label = _norm_label_short(response_label)
+
     check_truth = {}
-    # 记录预测标签
-    check_truth["pred_label"] = response_label
-    check_truth["label"] = (response_label[:2] == ground_truth.get("label"))
+    # 记录预测标签（保持未识别为 None）
+    check_truth["pred_label"] = pr_label
+    check_truth["label"] = (pr_label is not None and gt_label is not None and pr_label == gt_label)
 
     # 判断矛盾模态（仅当标注提供 error）
-    if ground_truth.get("error") != None:
+    if ground_truth.get("error") is not None:
         filter_ans = determine_contradiction(dict_response)
-        # 取“图像/文本”前缀的两个字
         cm = filter_ans.get("contradict_modality")
         error = cm[:2] if cm else None
         check_truth["pred_error"] = error
@@ -338,7 +364,7 @@ def check_answer(response: str, ground_truth: dict) -> dict:
         check_truth["pred_error"] = None
         check_truth["error"] = None
 
-    # 新增：把抽取到的 relationships 一并返回，便于外部记录
+    # 把抽取到的 relationships 一并返回，便于外部记录
     check_truth["relationships"] = rels
 
     return check_truth 
