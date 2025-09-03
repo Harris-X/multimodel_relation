@@ -444,7 +444,7 @@ def eval():
         if json_data is None:
             continue
 
-        text = json_data.get("msg", "")
+        text = json_data.get("text", "")
         response = chat(img1, img2, text, processor, model)
         result = check_answer(response, json_data)
 
