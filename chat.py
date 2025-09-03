@@ -1,7 +1,7 @@
 import json
 import os
 # 设置使用GPU 5
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from transformers import AutoProcessor, Glm4vForConditionalGeneration
 import torch
 from PIL import Image
@@ -336,6 +336,9 @@ def check_answer(response: str, ground_truth: dict) -> dict:
         check_truth["pred_error"] = None
         check_truth["error"] = None
 
+    # 新增：把抽取到的 relationships 一并返回，便于外部记录
+    check_truth["relationships"] = rels
+
     return check_truth 
 
 def read_json_file(file_path):
@@ -403,7 +406,8 @@ def eval():
         "id", "rgb_file", "infrared_file", "desc_file",
         "gt_label", "gt_error", "pred_label", "pred_error",
         "label_correct", "error_correct",
-        "model_output"  # 新增：记录模型原始输出
+        "relationships",
+        "model_output",
     ]
 
     # 若CSV不存在或为空，则先写表头
@@ -435,6 +439,10 @@ def eval():
         response = chat(img1, img2, text, processor, model)
         result = check_answer(response, json_data)
 
+        # relationships（本样本即时输出到控制台）
+        rels = result.get("relationships", [])
+        print(f"[{sid}] relationships: {json.dumps(rels, ensure_ascii=False)}")
+
         # 1) 模型原始输出写入独立日志（每个样本一个txt，及时写入）
         log_path = os.path.join(log_dir, f"{sid}.txt")
         try:
@@ -443,9 +451,18 @@ def eval():
         except Exception as e:
             print(f"写入日志失败 {log_path}: {e}")
 
+        # 1.1) relationships 也单独保留为 JSON（及时写入）
+        rel_path = os.path.join(log_dir, f"{sid}_relationships.json")
+        try:
+            with open(rel_path, "w", encoding="utf-8") as rf:
+                json.dump(rels, rf, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"写入关系日志失败 {rel_path}: {e}")
+
         # 2) 将该样本评测结果立即追加写入CSV
         #    为避免多行文本破坏CSV行结构，这里将换行替换为 \n
         model_out_for_csv = response.replace("\r\n", "\n").replace("\n", r"\n")
+        rels_for_csv = json.dumps(rels, ensure_ascii=False)
         row = [
             sid,
             rgb_file,
@@ -457,6 +474,7 @@ def eval():
             result.get("pred_error"),
             result.get("label"),
             result.get("error"),
+            rels_for_csv,
             model_out_for_csv,
         ]
         try:
