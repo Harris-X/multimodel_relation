@@ -419,9 +419,16 @@ def eval():
 
     processor, model = load_model()
 
+    # 评测统计（总体与分类别）
+    metrics = {
+        "total": 0,
+        "correct": 0,
+        "per_class": {}  # {label: {"total": x, "correct": y}}
+    }
+
     # 评测范围（保留你原来的起始下标）
     num = len(common_ids)
-    for i in range(9, num):
+    for i in range(num):
         sid = common_ids[i]
         rgb_file = rgb_map[sid]
         ir_file = ir_map[sid]
@@ -485,10 +492,68 @@ def eval():
         except Exception as e:
             print(f"写入CSV失败 {out_csv}: {e}")
 
+        # 3) 统计（总体与分类别）
+        gt_label = (json_data.get("label") or "").strip()
+        pred_ok = bool(result.get("label"))
+        if gt_label:
+            # 仅用前两个字归一（如“等价/等价关系”统一到“等价”）
+            cls = gt_label[:2]
+            cls_stat = metrics["per_class"].setdefault(cls, {"total": 0, "correct": 0})
+            cls_stat["total"] += 1
+            if pred_ok:
+                cls_stat["correct"] += 1
+
+        metrics["total"] += 1
+        if pred_ok:
+            metrics["correct"] += 1
+
         print(f"样本 {sid} 结果已记录到CSV与日志。")
 
-    print(f"评测完成。CSV: {out_csv}  日志目录: {log_dir}")
+    # 评测完成后，计算并写出总体/分类别准确率
+    def safe_div(a, b):
+        return (a / b) if b else 0.0
 
+    summary = {
+        "overall": {
+            "total": metrics["total"],
+            "correct": metrics["correct"],
+            "accuracy": round(safe_div(metrics["correct"], metrics["total"]), 6)
+        },
+        "per_class": {}
+    }
+    for cls, st in metrics["per_class"].items():
+        summary["per_class"][cls] = {
+            "total": st["total"],
+            "correct": st["correct"],
+            "accuracy": round(safe_div(st["correct"], st["total"]), 6)
+        }
+
+    # 写入 JSON 与 TXT 日志
+    metrics_json = os.path.join(log_dir, "metrics.json")
+    metrics_txt = os.path.join(log_dir, "metrics.txt")
+    try:
+        with open(metrics_json, "w", encoding="utf-8") as jf:
+            json.dump(summary, jf, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"写入指标JSON失败 {metrics_json}: {e}")
+
+    try:
+        lines = []
+        lines.append(f"Overall: {summary['overall']['correct']}/{summary['overall']['total']} "
+                     f"acc={summary['overall']['accuracy']:.4f}")
+        for cls, st in summary["per_class"].items():
+            lines.append(f"{cls}: {st['correct']}/{st['total']} acc={st['accuracy']:.4f}")
+        with open(metrics_txt, "w", encoding="utf-8") as tf:
+            tf.write("\n".join(lines) + "\n")
+    except Exception as e:
+        print(f"写入指标TXT失败 {metrics_txt}: {e}")
+
+    print("评测完成。")
+    print(f"Overall acc: {summary['overall']['accuracy']:.4f} "
+          f"({summary['overall']['correct']}/{summary['overall']['total']})")
+    for cls, st in summary["per_class"].items():
+        print(f"{cls} acc: {st['accuracy']:.4f} ({st['correct']}/{st['total']})")
+    print(f"指标文件: {metrics_json} / {metrics_txt}")
 
 
 if __name__ == "__main__":
