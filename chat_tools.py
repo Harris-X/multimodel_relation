@@ -1,7 +1,7 @@
 import json
 import os
 # 设置使用GPU 5
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 from transformers import AutoProcessor, Glm4vForConditionalGeneration
 import torch
 from PIL import Image
@@ -15,8 +15,12 @@ from sentence_transformers import SentenceTransformer # 新增
 MODEL_PATH = "/home/user/xieqiuhao/multimodel_relation/downloaded_model/GLM-4.1V-9B-Thinking"
 
 # # 加载本地图片
-# image_path1 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/rgb_img/3.jpg"
-# image_path2 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/thermal_img/3.jpg"
+image_path1 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/rgb_img/3.jpg"
+image_path2 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/thermal_img/3.jpg"
+
+# 可选文本；如无则仅图片+提示词
+# text = None
+text = "敌方坦克不在战场上"
 
 prompt = (
 """# 角色与任务
@@ -146,9 +150,6 @@ class GLM4VWrapper:
         output_text = self.processor.decode(new_tokens, skip_special_tokens=True)
         return output_text
 
-# 可选文本；如无则仅图片+提示词
-# text = None
-# text = "敌方坦克不在战场上"
 
 def build_initial_messages(image1: Image.Image, image2: Image.Image, prompt_text: str, extra_text: str | None):
     if extra_text:
@@ -246,7 +247,6 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
                 vision_model_func=glm_wrapper.model_func, # GLM4V 同时是 VLM
                 embedding_func=real_embedding_func # 使用真实的嵌入函数
             )
-            asyncio.run(rag_instance.initialize_storages())
             print("RAG-Anything 初始化完成。")
 
         except Exception as e:
@@ -773,5 +773,6 @@ def eval():
 
 
 if __name__ == "__main__":
-    # chat(image_path1,image_path2,text)
-    eval()
+    proccessor, model = load_model()
+    chat(image_path1,image_path2,text,proccessor,model,eval=False)
+    # eval()
