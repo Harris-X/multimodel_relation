@@ -1,12 +1,16 @@
 import json
 import os
 # 设置使用GPU 5
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 from transformers import AutoProcessor, Glm4vForConditionalGeneration
 import torch
 from PIL import Image
 import re
 import csv  # 新增
+import asyncio  # 新增
+from raganything import RAGAnything, RAGAnythingConfig # 新增
+from lightrag.utils import EmbeddingFunc # 新增
+from sentence_transformers import SentenceTransformer # 新增
 
 MODEL_PATH = "/home/user/xieqiuhao/multimodel_relation/downloaded_model/GLM-4.1V-9B-Thinking"
 
@@ -101,9 +105,50 @@ prompt = (
 """
 )
 
+# 新增：GLM-4V 模型包装器，用于适配 RAG-Anything
+class GLM4VWrapper:
+    def __init__(self, model, processor):
+        self.model = model
+        self.processor = processor
+
+    async def model_func(self, prompt, system_prompt=None, history_messages=[], messages=None, **kwargs):
+        """ 适配 llm_model_func 和 vision_model_func """
+        if messages:
+            # RAG-Anything 的 VLM 增强查询会使用 messages 格式
+            current_messages = messages
+        else:
+            # 构建标准对话消息
+            current_messages = []
+            if system_prompt:
+                current_messages.append({"role": "system", "content": system_prompt})
+            current_messages.extend(history_messages)
+            current_messages.append({"role": "user", "content": prompt})
+
+        inputs = self.processor.apply_chat_template(
+            current_messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(self.model.device)
+
+        with torch.inference_mode():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=kwargs.get('max_new_tokens', 2048),
+                do_sample=False,
+                temperature=0.6,
+                top_p=0.9,
+                repetition_penalty=1.05,
+            )
+        
+        new_tokens = generated_ids[0][inputs["input_ids"].shape[1]:]
+        output_text = self.processor.decode(new_tokens, skip_special_tokens=True)
+        return output_text
+
 # 可选文本；如无则仅图片+提示词
 # text = None
-# text = "密级：秘密  等级：紧急  时间：2023年5月10日  发报：军情局  收报：前线指挥部  抄送：各相关部门  主题：观察报告  正文：敌方坦克不在战场上"
+# text = "敌方坦克不在战场上"
 
 def build_initial_messages(image1: Image.Image, image2: Image.Image, prompt_text: str, extra_text: str | None):
     if extra_text:
@@ -169,7 +214,46 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
     first_reply = generate_and_print(messages, max_new_tokens=5096)
     if not eval:
         print("你可以继续输入文本与模型对话，输入 exit/quit 退出")
+        print("RAG 功能已启用。使用 `/rag <file_path>` 处理文档，使用 `/query <question>` 进行知识库问答。")
         messages.append({"role": "assistant", "content": [{"type": "text", "text": first_reply}]})
+
+        # ---- RAG-Anything 初始化 ----
+        rag_instance = None
+        try:
+            # 包装当前模型以供 RAG-Anything 使用
+            glm_wrapper = GLM4VWrapper(model, processor)
+            
+            # ---- 新增：配置真实的离线嵌入模型 ----
+            print("\n正在加载离线嵌入模型 Qwen/Qwen3-Embedding-0.6B...")
+            # 指定模型名称，首次使用会自动下载
+            embedding_model_name = 'Qwen/Qwen3-Embedding-0.6B'
+            # 加载模型，可以指定设备
+            embedding_model = SentenceTransformer(embedding_model_name, device=model.device)
+            
+            # 定义真实的 embedding_func
+            real_embedding_func = EmbeddingFunc(
+                embedding_dim=embedding_model.get_sentence_embedding_dimension(),
+                func=lambda texts: embedding_model.encode(texts, convert_to_tensor=True).cpu().numpy()
+            )
+            print("离线嵌入模型加载完成。")
+            # ---- 嵌入模型配置结束 ----
+
+
+            rag_config = RAGAnythingConfig(working_dir="./rag_storage")
+            rag_instance = RAGAnything(
+                config=rag_config,
+                llm_model_func=glm_wrapper.model_func,
+                vision_model_func=glm_wrapper.model_func, # GLM4V 同时是 VLM
+                embedding_func=real_embedding_func # 使用真实的嵌入函数
+            )
+            asyncio.run(rag_instance.initialize_storages())
+            print("RAG-Anything 初始化完成。")
+
+        except Exception as e:
+            print(f"RAG-Anything 初始化失败: {e}")
+            rag_instance = None
+        # ---- RAG-Anything 初始化结束 ----
+
 
         # 进入多轮对话循环（后续轮次仅追加文本）
         try:
@@ -180,6 +264,35 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
                     break
                 if not user_input:
                     continue
+
+                # ---- RAG-Anything 命令处理 ----
+                if user_input.startswith("/rag ") and rag_instance:
+                    file_path = user_input.split(" ", 1)[1].strip()
+                    if os.path.exists(file_path):
+                        print(f"正在使用 RAG-Anything 处理文档: {file_path}")
+                        try:
+                            asyncio.run(rag_instance.process_document_complete(file_path=file_path))
+                            print(f"文档 '{file_path}' 处理完成。")
+                        except Exception as e:
+                            print(f"处理文档时出错: {e}")
+                    else:
+                        print(f"错误：文件 '{file_path}' 不存在。")
+                    continue # 处理完命令后，等待下一次输入
+
+                if user_input.startswith("/query ") and rag_instance:
+                    question = user_input.split(" ", 1)[1].strip()
+                    print(f"正在使用 RAG-Anything 查询: {question}")
+                    try:
+                        # 使用 aquery 进行知识库查询
+                        rag_response = asyncio.run(rag_instance.aquery(question, mode="hybrid"))
+                        print(f"\n模型 (RAG)：\n{rag_response}\n")
+                        # 将 RAG 的回答也加入对话历史
+                        messages.append({"role": "user", "content": [{"type": "text", "text": user_input}]})
+                        messages.append({"role": "assistant", "content": [{"type": "text", "text": str(rag_response)}]})
+                    except Exception as e:
+                        print(f"RAG 查询时出错: {e}")
+                    continue # 处理完命令后，等待下一次输入
+                # ---- RAG-Anything 命令处理结束 ----
 
                 messages.append({"role": "user", "content": [{"type": "text", "text": user_input}]})
                 reply = generate_and_print(messages, max_new_tokens=2048)
