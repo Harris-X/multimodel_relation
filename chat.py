@@ -1,7 +1,7 @@
 import json
 import os
 # 设置使用GPU 5
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from transformers import AutoProcessor, Glm4vForConditionalGeneration
 import torch
 from PIL import Image
@@ -103,7 +103,7 @@ prompt = (
 
 # 可选文本；如无则仅图片+提示词
 # text = None
-# text = "密级：秘密  等级：紧急  时间：2023年5月10日  发报：军情局  收报：前线指挥部  抄送：各相关部门  主题：观察报告  正文：敌方坦克不在战场上"
+# text = "敌方坦克不在战场上"
 
 def build_initial_messages(image1: Image.Image, image2: Image.Image, prompt_text: str, extra_text: str | None):
     if extra_text:
