@@ -8,6 +8,7 @@ from PIL import Image
 import re
 import csv  # 新增
 import asyncio  # 新增
+import shlex # 新增，用于安全解析命令行风格的输入
 from raganything import RAGAnything, RAGAnythingConfig # 新增
 from lightrag.utils import EmbeddingFunc # 新增
 from sentence_transformers import SentenceTransformer # 新增
@@ -215,7 +216,7 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
     first_reply = generate_and_print(messages, max_new_tokens=5096)
     if not eval:
         print("你可以继续输入文本与模型对话，输入 exit/quit 退出")
-        print("RAG 功能已启用。使用 `/rag <file_path>` 处理文档，使用 `/query <question>` 进行知识库问答。")
+        print("RAG 功能已启用。使用 `/rag <file_path1> [<file_path2> ...]` 处理文档，使用 `/query <question>` 进行知识库问答。")
         messages.append({"role": "assistant", "content": [{"type": "text", "text": first_reply}]})
 
         # ---- RAG-Anything 初始化 ----
@@ -267,19 +268,68 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
 
                 # ---- RAG-Anything 命令处理 ----
                 if user_input.startswith("/rag ") and rag_instance:
-                    file_path = user_input.split(" ", 1)[1].strip()
-                    if os.path.exists(file_path):
-                        print(f"正在使用 RAG-Anything 处理文档: {file_path}")
-                        try:
-                            asyncio.run(rag_instance.process_document_complete(file_path=file_path))
-                            print(f"文档 '{file_path}' 处理完成。")
-                        except Exception as e:
-                            print(f"处理文档时出错: {e}")
+                    command_part = user_input[5:] # 获取 /rag 后面的所有内容
+                    question = None
+                    
+                    # 检查并分离复合指令中的 /query 部分
+                    if " /query " in command_part:
+                        rag_args_str, question = command_part.split(" /query ", 1)
                     else:
-                        print(f"错误：文件 '{file_path}' 不存在。")
+                        rag_args_str = command_part
+                    
+                    try:
+                        # 使用 shlex 解析文件路径，可以正确处理带空格的路径（需用引号）
+                        file_paths = shlex.split(rag_args_str)
+                    except ValueError as e:
+                        print(f"错误：文件路径解析失败，请检查引号是否匹配。 {e}")
+                        continue
+
+                    valid_paths = [p for p in file_paths if os.path.exists(p)]
+                    invalid_paths = [p for p in file_paths if not os.path.exists(p)]
+
+                    if invalid_paths:
+                        print(f"错误：以下文件不存在，已跳过：{', '.join(invalid_paths)}")
+                    
+                    if not valid_paths:
+                        print("错误：没有提供任何有效的文件路径。")
+                        continue
+
+                    try:
+                        if len(valid_paths) == 1:
+                            # 单个文件，使用 process_document_complete
+                            file_path = valid_paths[0]
+                            print(f"正在使用 RAG-Anything 处理单个文档: {file_path}")
+                            asyncio.run(rag_instance.process_document_complete(
+                                file_path=file_path,
+                                display_stats=True
+                            ))
+                            print(f"文档 '{file_path}' 处理完成。")
+                        else:
+                            # 多个文件，使用批处理
+                            print(f"正在使用 RAG-Anything 批处理 {len(valid_paths)} 个文档...")
+                            # 注意：process_documents_batch 是同步方法
+                            rag_instance.process_documents_batch(
+                                file_paths=valid_paths,
+                                show_progress=True
+                            )
+                            print("所有文档批处理完成。")
+                        
+                        # 如果是复合命令，继续执行查询部分
+                        if question:
+                            print(f"正在使用 RAG-Anything 查询: {question}")
+                            rag_response = asyncio.run(rag_instance.aquery(question, mode="hybrid"))
+                            print(f"\n模型 (RAG)：\n{rag_response}\n")
+                            messages.append({"role": "user", "content": [{"type": "text", "text": f"/query {question}"}]})
+                            messages.append({"role": "assistant", "content": [{"type": "text", "text": str(rag_response)}]})
+
+                    except Exception as e:
+                        print(f"处理文档时出错: {e}")
+                        import traceback
+                        traceback.print_exc()
+
                     continue # 处理完命令后，等待下一次输入
 
-                if user_input.startswith("/query ") and rag_instance:
+                elif user_input.startswith("/query ") and rag_instance:
                     question = user_input.split(" ", 1)[1].strip()
                     print(f"正在使用 RAG-Anything 查询: {question}")
                     try:
@@ -290,7 +340,12 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
                         messages.append({"role": "user", "content": [{"type": "text", "text": user_input}]})
                         messages.append({"role": "assistant", "content": [{"type": "text", "text": str(rag_response)}]})
                     except Exception as e:
-                        print(f"RAG 查询时出错: {e}")
+                        if "No LightRAG instance available" in str(e):
+                            print("错误：请先使用 /rag 命令处理至少一个文档后再进行查询。")
+                        else:
+                            print(f"RAG 查询时出错: {e}")
+                            import traceback
+                            traceback.print_exc()
                     continue # 处理完命令后，等待下一次输入
                 # ---- RAG-Anything 命令处理结束 ----
 
@@ -773,6 +828,6 @@ def eval():
 
 
 if __name__ == "__main__":
-    proccessor, model = load_model()
-    chat(image_path1,image_path2,text,proccessor,model,eval=False)
+    processor, model = load_model()
+    chat(image_path1,image_path2,text,processor,model,eval=False)
     # eval()
