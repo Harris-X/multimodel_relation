@@ -1,17 +1,16 @@
 import json
 import os
+import shlex
 # 设置使用GPU 5
 os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 from transformers import AutoProcessor, Glm4vForConditionalGeneration
-import torch
 from PIL import Image
-import re
-import csv  # 新增
-import asyncio  # 新增
-import shlex # 新增，用于安全解析命令行风格的输入
+# 新增 import
+import os, re, json, io, base64, asyncio, traceback
+import torch
+from sentence_transformers import SentenceTransformer # 新增
 from raganything import RAGAnything, RAGAnythingConfig # 新增
 from lightrag.utils import EmbeddingFunc # 新增
-from sentence_transformers import SentenceTransformer # 新增
 
 MODEL_PATH = "/home/user/xieqiuhao/multimodel_relation/downloaded_model/GLM-4.1V-9B-Thinking"
 
@@ -116,38 +115,104 @@ async def glm4v_model_func(prompt, model, processor, system_prompt=None, history
     适配 RAG-Anything 的 llm_model_func 和 vision_model_func。
     显式接收 model 和 processor 以避免 deepcopy 问题。
     """
+    def _decode_data_url_to_pil(url: str) -> Image.Image | None:
+        try:
+            # 仅处理 data:image/...;base64,xxxx 形式
+            if isinstance(url, str) and url.startswith("data:image") and ";base64," in url:
+                b64 = url.split(";base64,", 1)[1]
+                img_bytes = base64.b64decode(b64)
+                return Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        except Exception:
+            pass
+        return None
+
     if messages:
         # RAG-Anything 的 VLM 增强查询会使用 messages 格式
-        current_messages = messages
+        current_messages = []
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", [])
+            norm_content = []
+            for item in content if isinstance(content, list) else [content]:
+                if not isinstance(item, dict):
+                    continue
+                t = item.get("type")
+                if t == "image":
+                    # 可能已是 {"type":"image","image": PIL} 或 {"type":"image","url": "..."}
+                    if "image" in item and isinstance(item["image"], Image.Image):
+                        norm_content.append({"type": "image", "image": item["image"]})
+                    elif "url" in item:
+                        pil = _decode_data_url_to_pil(item["url"])
+                        if pil:
+                            norm_content.append({"type": "image", "image": pil})
+                        else:
+                            # 尝试直接传 url（GLM 也支持 http/https）
+                            norm_content.append({"type": "image", "url": item["url"]})
+                elif t == "image_url":
+                    # OpenAI 风格 {"type":"image_url","image_url":{"url": "..."}}
+                    url = (item.get("image_url") or {}).get("url")
+                    pil = _decode_data_url_to_pil(url) if url else None
+                    if pil:
+                        norm_content.append({"type": "image", "image": pil})
+                    elif url:
+                        norm_content.append({"type": "image", "url": url})
+                elif t == "text":
+                    txt = item.get("text", "")
+                    if isinstance(txt, str) and txt.strip():
+                        norm_content.append({"type": "text", "text": txt})
+            if norm_content:
+                current_messages.append({"role": role, "content": norm_content})
     else:
         # 构建标准对话消息
         current_messages = []
         if system_prompt:
-            current_messages.append({"role": "system", "content": system_prompt})
-        current_messages.extend(history_messages)
-        current_messages.append({"role": "user", "content": prompt})
+            current_messages.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
 
-    inputs = processor.apply_chat_template(
-        current_messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
-    ).to(model.device)
+        # 历史消息规范化
+        for msg in history_messages or []:
+            r = msg.get("role", "user")
+            c = msg.get("content", msg.get("text", ""))
+            if isinstance(c, list):
+                current_messages.append({"role": r, "content": c})
+            elif isinstance(c, str):
+                current_messages.append({"role": r, "content": [{"type": "text", "text": c}]})
 
-    with torch.inference_mode():
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=kwargs.get('max_new_tokens', 2048),
-            do_sample=False,
-            temperature=0.6,
-            top_p=0.9,
-            repetition_penalty=1.05,
-        )
-    
-    new_tokens = generated_ids[0][inputs["input_ids"].shape[1]:]
-    output_text = processor.decode(new_tokens, skip_special_tokens=True)
-    return output_text
+        # 处理当前 prompt
+        if isinstance(prompt, str):
+            current_messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        elif isinstance(prompt, list):
+            # 假设已经是 content 列表
+            current_messages.append({"role": "user", "content": prompt})
+        else:
+            current_messages.append({"role": "user", "content": [{"type": "text", "text": str(prompt)}]})
+
+    try:
+        inputs = processor.apply_chat_template(
+            current_messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(model.device)
+
+        gen_kwargs = {}
+        # 仅传入我们支持的参数，避免 "invalid generation flags" 警告
+        if "max_new_tokens" in kwargs:
+            gen_kwargs["max_new_tokens"] = kwargs["max_new_tokens"]
+        else:
+            gen_kwargs["max_new_tokens"] = 1024
+
+        with torch.inference_mode():
+            generated_ids = model.generate(**inputs, **gen_kwargs)
+
+        new_tokens = generated_ids[0][inputs["input_ids"].shape[1]:]
+        output_text = processor.decode(new_tokens, skip_special_tokens=True)
+        return output_text
+    except Exception as e:
+        print(f"GLM4V 模型函数执行出错: {e}")
+        print(f"消息格式: {current_messages}")
+        traceback.print_exc()
+        return f"模型处理出错: {str(e)}"
 
 
 # 新增：GLM-4V 模型包装器，用于适配 RAG-Anything
@@ -158,38 +223,15 @@ class GLM4VWrapper:
 
     async def model_func(self, prompt, system_prompt=None, history_messages=[], messages=None, **kwargs):
         """ 适配 llm_model_func 和 vision_model_func """
-        if messages:
-            # RAG-Anything 的 VLM 增强查询会使用 messages 格式
-            current_messages = messages
-        else:
-            # 构建标准对话消息
-            current_messages = []
-            if system_prompt:
-                current_messages.append({"role": "system", "content": system_prompt})
-            current_messages.extend(history_messages)
-            current_messages.append({"role": "user", "content": prompt})
-
-        inputs = self.processor.apply_chat_template(
-            current_messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        ).to(self.model.device)
-
-        with torch.inference_mode():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=kwargs.get('max_new_tokens', 2048),
-                do_sample=False,
-                temperature=0.6,
-                top_p=0.9,
-                repetition_penalty=1.05,
-            )
-        
-        new_tokens = generated_ids[0][inputs["input_ids"].shape[1]:]
-        output_text = self.processor.decode(new_tokens, skip_special_tokens=True)
-        return output_text
+        return await glm4v_model_func(
+            prompt=prompt,
+            model=self.model,
+            processor=self.processor,
+            system_prompt=system_prompt,
+            history_messages=history_messages,
+            messages=messages,
+            **kwargs,
+        )
 
 
 def build_initial_messages(image1: Image.Image, image2: Image.Image, prompt_text: str, extra_text: str | None):
@@ -237,14 +279,7 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
             return_tensors="pt",
         ).to(model.device)
         with torch.inference_mode():
-            generated_ids = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=0.6,
-                top_p=0.9,
-                repetition_penalty=1.05,
-            )
+            generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
         # 仅取新生成片段
         new_tokens = generated_ids[0][inputs["input_ids"].shape[1]:]
         output_text = processor.decode(new_tokens, skip_special_tokens=False)
@@ -265,35 +300,42 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
     # ---- RAG-Anything 初始化 ----
     rag_instance = None
     try:
-        # ---- 修改：使用 functools.partial 来包装函数，避免 deepcopy ----
         from functools import partial
-        
-        # 创建一个不包含大模型的、可被安全复制的函数
-        # partial 会把 model 和 processor 作为固定参数传入 glm4v_model_func
+
         safe_model_func = partial(glm4v_model_func, model=model, processor=processor)
 
-        # ---- 新增：配置真实的离线嵌入模型 ----
         print("\n正在加载离线嵌入模型 Qwen/Qwen3-Embedding-0.6B...")
-        # 指定模型名称，首次使用会自动下载
         embedding_model_name = 'Qwen/Qwen3-Embedding-0.6B'
-        # 加载模型，可以指定设备
-        embedding_model = SentenceTransformer(embedding_model_name, device=model.device)
-        
-        # 定义真实的 embedding_func
+        embedding_model = SentenceTransformer(embedding_model_name, device=str(model.device))
+
+        # 修改为"异步"嵌入函数，避免 await numpy.ndarray 报错
+        async def sbert_embed(texts):
+            loop = asyncio.get_running_loop()
+            def _encode(batch):
+                # 返回 list[list[float]]，RAG/LightRAG 更易兼容
+                vec = embedding_model.encode(batch, convert_to_numpy=True, normalize_embeddings=True)
+                return vec.tolist()
+            return await loop.run_in_executor(None, _encode, texts)
+
         real_embedding_func = EmbeddingFunc(
             embedding_dim=embedding_model.get_sentence_embedding_dimension(),
-            func=lambda texts: embedding_model.encode(texts, convert_to_tensor=True).cpu().numpy()
+            func=sbert_embed,  # 注意：此处为 async 函数
         )
         print("离线嵌入模型加载完成。")
-        # ---- 嵌入模型配置结束 ----
 
-
-        rag_config = RAGAnythingConfig(working_dir="./rag_storage")
+        # ---- 修改：禁用多模态处理功能 ----
+        rag_config = RAGAnythingConfig(
+            working_dir="./rag_storage",
+            # 禁用多模态处理以避免解析错误
+            enable_image_processing=False,
+            enable_table_processing=False,
+            enable_equation_processing=False
+        )
         rag_instance = RAGAnything(
             config=rag_config,
             llm_model_func=safe_model_func,
-            vision_model_func=safe_model_func, # GLM4V 同时是 VLM
-            embedding_func=real_embedding_func # 使用真实的嵌入函数
+            vision_model_func=safe_model_func,
+            embedding_func=real_embedding_func,
         )
         print("RAG-Anything 初始化完成。")
 
@@ -367,7 +409,8 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
                     # 如果是复合命令，继续执行查询部分
                     if question:
                         print(f"正在使用 RAG-Anything 查询: {question}")
-                        rag_response = asyncio.run(rag_instance.aquery(question, mode="hybrid"))
+                        # ---- 修改：使用同步查询方法 ----
+                        rag_response = rag_instance.query(question, mode="hybrid")
                         print(f"\n模型 (RAG)：\n{rag_response}\n")
                         messages.append({"role": "user", "content": [{"type": "text", "text": f"/query {question}"}]})
                         messages.append({"role": "assistant", "content": [{"type": "text", "text": str(rag_response)}]})
@@ -383,8 +426,9 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
                 question = user_input.split(" ", 1)[1].strip()
                 print(f"正在使用 RAG-Anything 查询: {question}")
                 try:
-                    # 使用 aquery 进行知识库查询
-                    rag_response = asyncio.run(rag_instance.aquery(question, mode="hybrid"))
+                    # ---- 修改：使用同步查询方法 ----
+                    # 使用 query 进行知识库查询
+                    rag_response = rag_instance.query(question, mode="hybrid")
                     print(f"\n模型 (RAG)：\n{rag_response}\n")
                     # 将 RAG 的回答也加入对话历史
                     messages.append({"role": "user", "content": [{"type": "text", "text": user_input}]})
@@ -400,7 +444,7 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
             # ---- RAG-Anything 命令处理结束 ----
 
             messages.append({"role": "user", "content": [{"type": "text", "text": user_input}]})
-            reply = generate_and_print(messages, max_new_tokens=2048)
+            reply = generate_and_print(messages, max_new_tokens=512)
             messages.append({"role": "assistant", "content": [{"type": "text", "text": reply}]})
     except KeyboardInterrupt:
         print("\n已中断。")
