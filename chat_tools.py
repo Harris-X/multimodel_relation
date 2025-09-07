@@ -1,7 +1,7 @@
 import json
 import os
 # 设置使用GPU 5
-os.environ["CUDA_VISIBLE_DEVICES"] = "6"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 from transformers import AutoProcessor, Glm4vForConditionalGeneration
 import torch
 from PIL import Image
@@ -110,6 +110,46 @@ prompt = (
 """
 )
 
+# ---- 修改：将 model_func 移出类，变成独立的函数 ----
+async def glm4v_model_func(prompt, model, processor, system_prompt=None, history_messages=[], messages=None, **kwargs):
+    """
+    适配 RAG-Anything 的 llm_model_func 和 vision_model_func。
+    显式接收 model 和 processor 以避免 deepcopy 问题。
+    """
+    if messages:
+        # RAG-Anything 的 VLM 增强查询会使用 messages 格式
+        current_messages = messages
+    else:
+        # 构建标准对话消息
+        current_messages = []
+        if system_prompt:
+            current_messages.append({"role": "system", "content": system_prompt})
+        current_messages.extend(history_messages)
+        current_messages.append({"role": "user", "content": prompt})
+
+    inputs = processor.apply_chat_template(
+        current_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+    with torch.inference_mode():
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=kwargs.get('max_new_tokens', 2048),
+            do_sample=False,
+            temperature=0.6,
+            top_p=0.9,
+            repetition_penalty=1.05,
+        )
+    
+    new_tokens = generated_ids[0][inputs["input_ids"].shape[1]:]
+    output_text = processor.decode(new_tokens, skip_special_tokens=True)
+    return output_text
+
+
 # 新增：GLM-4V 模型包装器，用于适配 RAG-Anything
 class GLM4VWrapper:
     def __init__(self, model, processor):
@@ -211,150 +251,160 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
         print(f"\n模型：\n{output_text}\n")
         return output_text
 
-    # 首轮回答（基于两张图 + 提示词）
-    print("检测中，请稍等。")
-    first_reply = generate_and_print(messages, max_new_tokens=5096)
-    if not eval:
-        print("你可以继续输入文本与模型对话，输入 exit/quit 退出")
-        print("RAG 功能已启用。使用 `/rag <file_path1> [<file_path2> ...]` 处理文档，使用 `/query <question>` 进行知识库问答。")
-        messages.append({"role": "assistant", "content": [{"type": "text", "text": first_reply}]})
+    # ---- 修改：修复 NameError ----
+    if eval:
+        # 评测模式：生成首轮回答并返回
+        print("检测中，请稍等。")
+        first_reply = generate_and_print(messages, max_new_tokens=5096)
+        return first_reply
+    
+    # 交互模式
+    print("输入文本与模型对话，输入 exit/quit 退出")
+    print("RAG 功能已启用。使用 `/rag <file_path1> [<file_path2> ...]` 处理文档，使用 `/query <question>` 进行知识库问答。")
+    
+    # ---- RAG-Anything 初始化 ----
+    rag_instance = None
+    try:
+        # ---- 修改：使用 functools.partial 来包装函数，避免 deepcopy ----
+        from functools import partial
+        
+        # 创建一个不包含大模型的、可被安全复制的函数
+        # partial 会把 model 和 processor 作为固定参数传入 glm4v_model_func
+        safe_model_func = partial(glm4v_model_func, model=model, processor=processor)
 
-        # ---- RAG-Anything 初始化 ----
+        # ---- 新增：配置真实的离线嵌入模型 ----
+        print("\n正在加载离线嵌入模型 Qwen/Qwen3-Embedding-0.6B...")
+        # 指定模型名称，首次使用会自动下载
+        embedding_model_name = 'Qwen/Qwen3-Embedding-0.6B'
+        # 加载模型，可以指定设备
+        embedding_model = SentenceTransformer(embedding_model_name, device=model.device)
+        
+        # 定义真实的 embedding_func
+        real_embedding_func = EmbeddingFunc(
+            embedding_dim=embedding_model.get_sentence_embedding_dimension(),
+            func=lambda texts: embedding_model.encode(texts, convert_to_tensor=True).cpu().numpy()
+        )
+        print("离线嵌入模型加载完成。")
+        # ---- 嵌入模型配置结束 ----
+
+
+        rag_config = RAGAnythingConfig(working_dir="./rag_storage")
+        rag_instance = RAGAnything(
+            config=rag_config,
+            llm_model_func=safe_model_func,
+            vision_model_func=safe_model_func, # GLM4V 同时是 VLM
+            embedding_func=real_embedding_func # 使用真实的嵌入函数
+        )
+        print("RAG-Anything 初始化完成。")
+
+    except Exception as e:
+        print(f"RAG-Anything 初始化失败: {e}")
+        import traceback
+        traceback.print_exc()
         rag_instance = None
-        try:
-            # 包装当前模型以供 RAG-Anything 使用
-            glm_wrapper = GLM4VWrapper(model, processor)
-            
-            # ---- 新增：配置真实的离线嵌入模型 ----
-            print("\n正在加载离线嵌入模型 Qwen/Qwen3-Embedding-0.6B...")
-            # 指定模型名称，首次使用会自动下载
-            embedding_model_name = 'Qwen/Qwen3-Embedding-0.6B'
-            # 加载模型，可以指定设备
-            embedding_model = SentenceTransformer(embedding_model_name, device=model.device)
-            
-            # 定义真实的 embedding_func
-            real_embedding_func = EmbeddingFunc(
-                embedding_dim=embedding_model.get_sentence_embedding_dimension(),
-                func=lambda texts: embedding_model.encode(texts, convert_to_tensor=True).cpu().numpy()
-            )
-            print("离线嵌入模型加载完成。")
-            # ---- 嵌入模型配置结束 ----
+    # ---- RAG-Anything 初始化结束 ----
 
 
-            rag_config = RAGAnythingConfig(working_dir="./rag_storage")
-            rag_instance = RAGAnything(
-                config=rag_config,
-                llm_model_func=glm_wrapper.model_func,
-                vision_model_func=glm_wrapper.model_func, # GLM4V 同时是 VLM
-                embedding_func=real_embedding_func # 使用真实的嵌入函数
-            )
-            print("RAG-Anything 初始化完成。")
+    # 进入多轮对话循环（后续轮次仅追加文本）
+    try:
+        # 在交互模式开始时，先进行一次初始分析
+        while True:
+            user_input = input("你：").strip()
+            if user_input.lower() in {"exit", "quit", "q"}:
+                print("已退出。")
+                break
+            if not user_input:
+                continue
 
-        except Exception as e:
-            print(f"RAG-Anything 初始化失败: {e}")
-            rag_instance = None
-        # ---- RAG-Anything 初始化结束 ----
-
-
-        # 进入多轮对话循环（后续轮次仅追加文本）
-        try:
-            while True:
-                user_input = input("你：").strip()
-                if user_input.lower() in {"exit", "quit", "q"}:
-                    print("已退出。")
-                    break
-                if not user_input:
+            # ---- RAG-Anything 命令处理 ----
+            if user_input.startswith("/rag ") and rag_instance:
+                command_part = user_input[5:] # 获取 /rag 后面的所有内容
+                question = None
+                
+                # 检查并分离复合指令中的 /query 部分
+                if " /query " in command_part:
+                    rag_args_str, question = command_part.split(" /query ", 1)
+                else:
+                    rag_args_str = command_part
+                
+                try:
+                    # 使用 shlex 解析文件路径，可以正确处理带空格的路径（需用引号）
+                    file_paths = shlex.split(rag_args_str)
+                except ValueError as e:
+                    print(f"错误：文件路径解析失败，请检查引号是否匹配。 {e}")
                     continue
 
-                # ---- RAG-Anything 命令处理 ----
-                if user_input.startswith("/rag ") and rag_instance:
-                    command_part = user_input[5:] # 获取 /rag 后面的所有内容
-                    question = None
-                    
-                    # 检查并分离复合指令中的 /query 部分
-                    if " /query " in command_part:
-                        rag_args_str, question = command_part.split(" /query ", 1)
+                valid_paths = [p for p in file_paths if os.path.exists(p)]
+                invalid_paths = [p for p in file_paths if not os.path.exists(p)]
+
+                if invalid_paths:
+                    print(f"错误：以下文件不存在，已跳过：{', '.join(invalid_paths)}")
+                
+                if not valid_paths:
+                    print("错误：没有提供任何有效的文件路径。")
+                    continue
+
+                try:
+                    if len(valid_paths) == 1:
+                        # 单个文件，使用 process_document_complete
+                        file_path = valid_paths[0]
+                        print(f"正在使用 RAG-Anything 处理单个文档: {file_path}")
+                        asyncio.run(rag_instance.process_document_complete(
+                            file_path=file_path,
+                            display_stats=True
+                        ))
+                        print(f"文档 '{file_path}' 处理完成。")
                     else:
-                        rag_args_str = command_part
+                        # 多个文件，使用批处理
+                        print(f"正在使用 RAG-Anything 批处理 {len(valid_paths)} 个文档...")
+                        # 注意：process_documents_batch 是同步方法
+                        rag_instance.process_documents_batch(
+                            file_paths=valid_paths,
+                            show_progress=True
+                        )
+                        print("所有文档批处理完成。")
                     
-                    try:
-                        # 使用 shlex 解析文件路径，可以正确处理带空格的路径（需用引号）
-                        file_paths = shlex.split(rag_args_str)
-                    except ValueError as e:
-                        print(f"错误：文件路径解析失败，请检查引号是否匹配。 {e}")
-                        continue
-
-                    valid_paths = [p for p in file_paths if os.path.exists(p)]
-                    invalid_paths = [p for p in file_paths if not os.path.exists(p)]
-
-                    if invalid_paths:
-                        print(f"错误：以下文件不存在，已跳过：{', '.join(invalid_paths)}")
-                    
-                    if not valid_paths:
-                        print("错误：没有提供任何有效的文件路径。")
-                        continue
-
-                    try:
-                        if len(valid_paths) == 1:
-                            # 单个文件，使用 process_document_complete
-                            file_path = valid_paths[0]
-                            print(f"正在使用 RAG-Anything 处理单个文档: {file_path}")
-                            asyncio.run(rag_instance.process_document_complete(
-                                file_path=file_path,
-                                display_stats=True
-                            ))
-                            print(f"文档 '{file_path}' 处理完成。")
-                        else:
-                            # 多个文件，使用批处理
-                            print(f"正在使用 RAG-Anything 批处理 {len(valid_paths)} 个文档...")
-                            # 注意：process_documents_batch 是同步方法
-                            rag_instance.process_documents_batch(
-                                file_paths=valid_paths,
-                                show_progress=True
-                            )
-                            print("所有文档批处理完成。")
-                        
-                        # 如果是复合命令，继续执行查询部分
-                        if question:
-                            print(f"正在使用 RAG-Anything 查询: {question}")
-                            rag_response = asyncio.run(rag_instance.aquery(question, mode="hybrid"))
-                            print(f"\n模型 (RAG)：\n{rag_response}\n")
-                            messages.append({"role": "user", "content": [{"type": "text", "text": f"/query {question}"}]})
-                            messages.append({"role": "assistant", "content": [{"type": "text", "text": str(rag_response)}]})
-
-                    except Exception as e:
-                        print(f"处理文档时出错: {e}")
-                        import traceback
-                        traceback.print_exc()
-
-                    continue # 处理完命令后，等待下一次输入
-
-                elif user_input.startswith("/query ") and rag_instance:
-                    question = user_input.split(" ", 1)[1].strip()
-                    print(f"正在使用 RAG-Anything 查询: {question}")
-                    try:
-                        # 使用 aquery 进行知识库查询
+                    # 如果是复合命令，继续执行查询部分
+                    if question:
+                        print(f"正在使用 RAG-Anything 查询: {question}")
                         rag_response = asyncio.run(rag_instance.aquery(question, mode="hybrid"))
                         print(f"\n模型 (RAG)：\n{rag_response}\n")
-                        # 将 RAG 的回答也加入对话历史
-                        messages.append({"role": "user", "content": [{"type": "text", "text": user_input}]})
+                        messages.append({"role": "user", "content": [{"type": "text", "text": f"/query {question}"}]})
                         messages.append({"role": "assistant", "content": [{"type": "text", "text": str(rag_response)}]})
-                    except Exception as e:
-                        if "No LightRAG instance available" in str(e):
-                            print("错误：请先使用 /rag 命令处理至少一个文档后再进行查询。")
-                        else:
-                            print(f"RAG 查询时出错: {e}")
-                            import traceback
-                            traceback.print_exc()
-                    continue # 处理完命令后，等待下一次输入
-                # ---- RAG-Anything 命令处理结束 ----
 
-                messages.append({"role": "user", "content": [{"type": "text", "text": user_input}]})
-                reply = generate_and_print(messages, max_new_tokens=2048)
-                messages.append({"role": "assistant", "content": [{"type": "text", "text": reply}]})
-        except KeyboardInterrupt:
-            print("\n已中断。")
-    return first_reply
+                except Exception as e:
+                    print(f"处理文档时出错: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                continue # 处理完命令后，等待下一次输入
+
+            elif user_input.startswith("/query ") and rag_instance:
+                question = user_input.split(" ", 1)[1].strip()
+                print(f"正在使用 RAG-Anything 查询: {question}")
+                try:
+                    # 使用 aquery 进行知识库查询
+                    rag_response = asyncio.run(rag_instance.aquery(question, mode="hybrid"))
+                    print(f"\n模型 (RAG)：\n{rag_response}\n")
+                    # 将 RAG 的回答也加入对话历史
+                    messages.append({"role": "user", "content": [{"type": "text", "text": user_input}]})
+                    messages.append({"role": "assistant", "content": [{"type": "text", "text": str(rag_response)}]})
+                except Exception as e:
+                    if "No LightRAG instance available" in str(e):
+                        print("错误：请先使用 /rag 命令处理至少一个文档后再进行查询。")
+                    else:
+                        print(f"RAG 查询时出错: {e}")
+                        import traceback
+                        traceback.print_exc()
+                continue # 处理完命令后，等待下一次输入
+            # ---- RAG-Anything 命令处理结束 ----
+
+            messages.append({"role": "user", "content": [{"type": "text", "text": user_input}]})
+            reply = generate_and_print(messages, max_new_tokens=2048)
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": reply}]})
+    except KeyboardInterrupt:
+        print("\n已中断。")
+    return None # 交互模式下，函数结束时没有单一的返回值
 
 def extract_first_paragraph_after_answer(s: str) -> str:
     m = re.search(r'<answer>(.*?)(?:</answer>|$)', s, flags=re.S)
