@@ -1,26 +1,211 @@
 import json
 import os
-import shlex
+import sqlite3
 # 设置使用GPU 5
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 from transformers import AutoProcessor, Glm4vForConditionalGeneration
-from PIL import Image
-# 新增 import
-import os, re, json, io, base64, asyncio, traceback
 import torch
-from sentence_transformers import SentenceTransformer # 新增
-from raganything import RAGAnything, RAGAnythingConfig # 新增
-from lightrag.utils import EmbeddingFunc # 新增
+from PIL import Image
+import re
+import csv  # 新增
+
+
+# LangChain 相关引用
+from typing import Any, List, Optional
+from langchain_community.utilities import SQLDatabase
+from langchain_community.agent_toolkits.sql.base import create_sql_agent
+from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
+from langchain_core.language_models.llms import LLM
+from transformers import AutoProcessor, Glm4vForConditionalGeneration
+
+
 
 MODEL_PATH = "/home/user/xieqiuhao/multimodel_relation/downloaded_model/GLM-4.1V-9B-Thinking"
+DB_PATH = "knowledge_base.db"  # 定义数据库文件路径
 
-# # 加载本地图片
-image_path1 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/rgb_img/3.jpg"
-image_path2 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/thermal_img/3.jpg"
 
-# 可选文本；如无则仅图片+提示词
-# text = None
-text = "敌方坦克不在战场上"
+# --- 新增：LangChain 自定义LLM包装类 ---
+class CustomGLM(LLM):
+    """
+    针对本地部署的 GLM-4.1V 模型的 LangChain LLM 包装类。
+    """
+    processor: Any
+    model: Any
+
+    @property
+    def _llm_type(self) -> str:
+        return "custom_glm"
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> str:
+        """
+        实现LLM的核心调用逻辑，用于Agent的文本生成。
+        """
+        # Agent的思考过程是纯文本的，因此我们只构建文本输入
+        messages = [{"role": "user", "content": prompt}]
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt"
+        ).to(self.model.device)
+
+        with torch.inference_mode():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=2048,
+                do_sample=False,
+                temperature=0.6,
+                top_p=0.9,
+                repetition_penalty=1.05,
+            )
+
+        # 解码生成的文本
+        new_tokens = generated_ids[0][inputs["input_ids"].shape[1]:]
+        output_text = self.processor.decode(new_tokens, skip_special_tokens=True).strip()
+
+        # LangChain Agent依赖于特定的停止序列来分割思考和行动
+        if stop is not None:
+            for s in stop:
+                if output_text.endswith(s):
+                    output_text = output_text[:-len(s)]
+        
+        # 移除可能由模型生成的多余的 "Thought:" 标记，防止Agent解析混乱
+        if "Thought:" in output_text:
+            output_text = output_text.split("Thought:")[0]
+
+        return output_text
+
+# --- 新增：数据库设置函数 ---
+def setup_database_from_schema(db_path: str):
+    """
+    根据 PDF 中的表结构，创建并初始化一个 SQLite 数据库。
+    """
+    if os.path.exists(db_path):
+        os.remove(db_path)
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # [cite_start]根据PDF文件中的表结构创建表 [cite: 12, 27, 36, 52, 53, 68, 69, 70, 71, 72, 78, 104]
+    # 使用TEXT, INTEGER, REAL, BLOB来对应SQL数据类型
+    # varchar -> TEXT, number -> INTEGER/REAL, timestamp -> DATETIME, enum -> INTEGER, string -> TEXT
+    
+    # 实体关系抽取项目表
+    cursor.execute("""
+    CREATE TABLE extract_projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at DATETIME,
+        entity_total INTEGER,
+        entity_correct_accuracy_number INTEGER,
+        event_total INTEGER,
+        event_accuracy REAL,
+        relation_accuracy REAL
+    );
+    """)
+
+    # 抽取文件表
+    cursor.execute("""
+    CREATE TABLE extract_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_name TEXT,
+        file_type TEXT,
+        file_key TEXT,
+        created_at DATETIME,
+        label TEXT,
+        project_id INTEGER
+    );
+    """)
+
+    # 抽取实体表
+    cursor.execute("""
+    CREATE TABLE extract_entities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        type TEXT,
+        created_at DATETIME,
+        is_event INTEGER,
+        status INTEGER,
+        file_id INTEGER
+    );
+    """)
+
+    # 抽取关系表
+    cursor.execute("""
+    CREATE TABLE extract_relations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        from_id TEXT,
+        to_id TEXT,
+        created_at DATETIME,
+        status INTEGER,
+        file_id INTEGER
+    );
+    """)
+
+    # 数据一致性项目表
+    cursor.execute("""
+    CREATE TABLE consistency_projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at DATETIME,
+        infer_relation_accuracy REAL,
+        consistency_cognition_accuracy_number INTEGER,
+        equivalence_relationship_accur_number INTEGER,
+        conflict_relationship_accuracy_number INTEGER,
+        relation_accuracy REAL,
+        dataset_ids TEXT
+    );
+    """)
+    
+    # 数据集表
+    cursor.execute("""
+    CREATE TABLE dataset (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        description TEXT,
+        created_at DATETIME,
+        rgb_file_id TEXT,
+        infrared_file_id TEXT,
+        text_file_id TEXT
+    );
+    """)
+
+    # 多模态数据组表
+    cursor.execute("""
+    CREATE TABLE multi_model_data_groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER,
+        rgb_file_id TEXT,
+        image_file_id TEXT,
+        text_file_id TEXT,
+        created_at DATETIME,
+        semantic_relation_accuracy REAL,
+        extract_similarity REAL,
+        fusion_similarity REAL,
+        original_image TEXT,
+        extract_image TEXT
+    );
+    """)
+
+    # 为了演示效果，插入一些示例数据
+    cursor.execute("""
+    INSERT INTO extract_projects (id, entity_total, event_total, relation_accuracy) 
+    VALUES (101, 1500, 200, 0.95), (102, 2500, 350, 0.92);
+    """)
+    cursor.execute("""
+    INSERT INTO extract_entities (id, name, type, file_id) 
+    VALUES (1, '敌军坦克', '装备', 1), (2, '士兵', '人员', 1), (3, '指挥中心', '设施', 2);
+    """)
+    cursor.execute("""
+    INSERT INTO dataset (id, name, description) 
+    VALUES (20, '沙漠风暴行动', '关于1991年海湾战争的数据集'), (21, '红旗军演', '多国空军联合演习数据集');
+    """)
+
+    conn.commit()
+    conn.close()
+    print(f"数据库 '{db_path}' 已创建并初始化。")
+
+
+
 
 prompt = (
 """# 角色与任务
@@ -109,129 +294,6 @@ prompt = (
 """
 )
 
-# ---- 修改：将 model_func 移出类，变成独立的函数 ----
-async def glm4v_model_func(prompt, model, processor, system_prompt=None, history_messages=[], messages=None, **kwargs):
-    """
-    适配 RAG-Anything 的 llm_model_func 和 vision_model_func。
-    显式接收 model 和 processor 以避免 deepcopy 问题。
-    """
-    def _decode_data_url_to_pil(url: str) -> Image.Image | None:
-        try:
-            # 仅处理 data:image/...;base64,xxxx 形式
-            if isinstance(url, str) and url.startswith("data:image") and ";base64," in url:
-                b64 = url.split(";base64,", 1)[1]
-                img_bytes = base64.b64decode(b64)
-                return Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        except Exception:
-            pass
-        return None
-
-    if messages:
-        # RAG-Anything 的 VLM 增强查询会使用 messages 格式
-        current_messages = []
-        for m in messages:
-            role = m.get("role", "user")
-            content = m.get("content", [])
-            norm_content = []
-            for item in content if isinstance(content, list) else [content]:
-                if not isinstance(item, dict):
-                    continue
-                t = item.get("type")
-                if t == "image":
-                    # 可能已是 {"type":"image","image": PIL} 或 {"type":"image","url": "..."}
-                    if "image" in item and isinstance(item["image"], Image.Image):
-                        norm_content.append({"type": "image", "image": item["image"]})
-                    elif "url" in item:
-                        pil = _decode_data_url_to_pil(item["url"])
-                        if pil:
-                            norm_content.append({"type": "image", "image": pil})
-                        else:
-                            # 尝试直接传 url（GLM 也支持 http/https）
-                            norm_content.append({"type": "image", "url": item["url"]})
-                elif t == "image_url":
-                    # OpenAI 风格 {"type":"image_url","image_url":{"url": "..."}}
-                    url = (item.get("image_url") or {}).get("url")
-                    pil = _decode_data_url_to_pil(url) if url else None
-                    if pil:
-                        norm_content.append({"type": "image", "image": pil})
-                    elif url:
-                        norm_content.append({"type": "image", "url": url})
-                elif t == "text":
-                    txt = item.get("text", "")
-                    if isinstance(txt, str) and txt.strip():
-                        norm_content.append({"type": "text", "text": txt})
-            if norm_content:
-                current_messages.append({"role": role, "content": norm_content})
-    else:
-        # 构建标准对话消息
-        current_messages = []
-        if system_prompt:
-            current_messages.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
-
-        # 历史消息规范化
-        for msg in history_messages or []:
-            r = msg.get("role", "user")
-            c = msg.get("content", msg.get("text", ""))
-            if isinstance(c, list):
-                current_messages.append({"role": r, "content": c})
-            elif isinstance(c, str):
-                current_messages.append({"role": r, "content": [{"type": "text", "text": c}]})
-
-        # 处理当前 prompt
-        if isinstance(prompt, str):
-            current_messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
-        elif isinstance(prompt, list):
-            # 假设已经是 content 列表
-            current_messages.append({"role": "user", "content": prompt})
-        else:
-            current_messages.append({"role": "user", "content": [{"type": "text", "text": str(prompt)}]})
-
-    try:
-        inputs = processor.apply_chat_template(
-            current_messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        ).to(model.device)
-
-        gen_kwargs = {}
-        # 仅传入我们支持的参数，避免 "invalid generation flags" 警告
-        if "max_new_tokens" in kwargs:
-            gen_kwargs["max_new_tokens"] = kwargs["max_new_tokens"]
-        else:
-            gen_kwargs["max_new_tokens"] = 1024
-
-        with torch.inference_mode():
-            generated_ids = model.generate(**inputs, **gen_kwargs)
-
-        new_tokens = generated_ids[0][inputs["input_ids"].shape[1]:]
-        output_text = processor.decode(new_tokens, skip_special_tokens=True)
-        return output_text
-    except Exception as e:
-        print(f"GLM4V 模型函数执行出错: {e}")
-        print(f"消息格式: {current_messages}")
-        traceback.print_exc()
-        return f"模型处理出错: {str(e)}"
-
-
-# 新增：GLM-4V 模型包装器，用于适配 RAG-Anything
-class GLM4VWrapper:
-    def __init__(self, model, processor):
-        self.model = model
-        self.processor = processor
-
-    async def model_func(self, prompt, system_prompt=None, history_messages=[], messages=None, **kwargs):
-        """ 适配 llm_model_func 和 vision_model_func """
-        return await glm4v_model_func(
-            prompt=prompt,
-            model=self.model,
-            processor=self.processor,
-            system_prompt=system_prompt,
-            history_messages=history_messages,
-            messages=messages,
-            **kwargs,
-        )
 
 
 def build_initial_messages(image1: Image.Image, image2: Image.Image, prompt_text: str, extra_text: str | None):
@@ -279,176 +341,76 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
             return_tensors="pt",
         ).to(model.device)
         with torch.inference_mode():
-            generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=0.6,
+                top_p=0.9,
+                repetition_penalty=1.05,
+            )
         # 仅取新生成片段
         new_tokens = generated_ids[0][inputs["input_ids"].shape[1]:]
         output_text = processor.decode(new_tokens, skip_special_tokens=False)
         print(f"\n模型：\n{output_text}\n")
         return output_text
 
-    # ---- 修改：修复 NameError ----
-    if eval:
-        # 评测模式：生成首轮回答并返回
-        print("检测中，请稍等。")
-        first_reply = generate_and_print(messages, max_new_tokens=5096)
-        return first_reply
-    
-    # 交互模式
-    print("输入文本与模型对话，输入 exit/quit 退出")
-    print("RAG 功能已启用。使用 `/rag <file_path1> [<file_path2> ...]` 处理文档，使用 `/query <question>` 进行知识库问答。")
-    
-    # ---- RAG-Anything 初始化 ----
-    rag_instance = None
-    try:
-        from functools import partial
+    # 首轮回答（基于两张图 + 提示词）
+    print("检测中，请稍等。")
+    first_reply = generate_and_print(messages, max_new_tokens=5096)
+    # --- 核心修改：对话部分集成 LangChain SQL Agent ---
+    if not eval:
+        print("你可以继续输入文本与模型对话，或询问关于数据库的问题。输入 exit/quit 退出")
+        # 多轮对话不再直接调用 generate_and_print，而是使用Agent
+        
+        # 1. 初始化数据库
+        setup_database_from_schema(DB_PATH)
+        db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
 
-        safe_model_func = partial(glm4v_model_func, model=model, processor=processor)
+        # 2. 封装本地LLM
+        llm = CustomGLM(processor=processor, model=model)
 
-        print("\n正在加载离线嵌入模型 Qwen/Qwen3-Embedding-0.6B...")
-        embedding_model_name = 'Qwen/Qwen3-Embedding-0.6B'
-        embedding_model = SentenceTransformer(embedding_model_name, device=str(model.device))
-
-        # 修改为"异步"嵌入函数，避免 await numpy.ndarray 报错
-        async def sbert_embed(texts):
-            loop = asyncio.get_running_loop()
-            def _encode(batch):
-                # 返回 list[list[float]]，RAG/LightRAG 更易兼容
-                vec = embedding_model.encode(batch, convert_to_numpy=True, normalize_embeddings=True)
-                return vec.tolist()
-            return await loop.run_in_executor(None, _encode, texts)
-
-        real_embedding_func = EmbeddingFunc(
-            embedding_dim=embedding_model.get_sentence_embedding_dimension(),
-            func=sbert_embed,  # 注意：此处为 async 函数
+        # 3. 创建SQL Agent
+        toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+        agent_executor = create_sql_agent(
+            llm=llm,
+            toolkit=toolkit,
+            verbose=True, # 开启详细模式，方便观察Agent思考过程
+            handle_parsing_errors=True, # 增加鲁棒性
         )
-        print("离线嵌入模型加载完成。")
-
-        # ---- 修改：禁用多模态处理功能 ----
-        rag_config = RAGAnythingConfig(
-            working_dir="./rag_storage",
-            # 禁用多模态处理以避免解析错误
-            enable_image_processing=False,
-            enable_table_processing=False,
-            enable_equation_processing=False
-        )
-        rag_instance = RAGAnything(
-            config=rag_config,
-            llm_model_func=safe_model_func,
-            vision_model_func=safe_model_func,
-            embedding_func=real_embedding_func,
-        )
-        print("RAG-Anything 初始化完成。")
-
-    except Exception as e:
-        print(f"RAG-Anything 初始化失败: {e}")
-        import traceback
-        traceback.print_exc()
-        rag_instance = None
-    # ---- RAG-Anything 初始化结束 ----
-
-
-    # 进入多轮对话循环（后续轮次仅追加文本）
-    try:
-        # 在交互模式开始时，先进行一次初始分析
-        while True:
-            user_input = input("你：").strip()
-            if user_input.lower() in {"exit", "quit", "q"}:
-                print("已退出。")
-                break
-            if not user_input:
-                continue
-
-            # ---- RAG-Anything 命令处理 ----
-            if user_input.startswith("/rag ") and rag_instance:
-                command_part = user_input[5:] # 获取 /rag 后面的所有内容
-                question = None
-                
-                # 检查并分离复合指令中的 /query 部分
-                if " /query " in command_part:
-                    rag_args_str, question = command_part.split(" /query ", 1)
-                else:
-                    rag_args_str = command_part
-                
-                try:
-                    # 使用 shlex 解析文件路径，可以正确处理带空格的路径（需用引号）
-                    file_paths = shlex.split(rag_args_str)
-                except ValueError as e:
-                    print(f"错误：文件路径解析失败，请检查引号是否匹配。 {e}")
+        
+        # 4. 进入Agent驱动的多轮对话循环
+        try:
+            while True:
+                user_input = input("你：").strip()
+                if user_input.lower() in {"exit", "quit", "q"}:
+                    print("已退出。")
+                    break
+                if not user_input:
                     continue
-
-                valid_paths = [p for p in file_paths if os.path.exists(p)]
-                invalid_paths = [p for p in file_paths if not os.path.exists(p)]
-
-                if invalid_paths:
-                    print(f"错误：以下文件不存在，已跳过：{', '.join(invalid_paths)}")
                 
-                if not valid_paths:
-                    print("错误：没有提供任何有效的文件路径。")
-                    continue
-
+                # 调用Agent执行任务
                 try:
-                    if len(valid_paths) == 1:
-                        # 单个文件，使用 process_document_complete
-                        file_path = valid_paths[0]
-                        print(f"正在使用 RAG-Anything 处理单个文档: {file_path}")
-                        asyncio.run(rag_instance.process_document_complete(
-                            file_path=file_path,
-                            display_stats=True
-                        ))
-                        print(f"文档 '{file_path}' 处理完成。")
-                    else:
-                        # 多个文件，使用批处理
-                        print(f"正在使用 RAG-Anything 批处理 {len(valid_paths)} 个文档...")
-                        # 注意：process_documents_batch 是同步方法
-                        rag_instance.process_documents_batch(
-                            file_paths=valid_paths,
-                            show_progress=True
-                        )
-                        print("所有文档批处理完成。")
-                    
-                    # 如果是复合命令，继续执行查询部分
-                    if question:
-                        print(f"正在使用 RAG-Anything 查询: {question}")
-                        # ---- 修改：使用同步查询方法 ----
-                        rag_response = rag_instance.query(question, mode="hybrid")
-                        print(f"\n模型 (RAG)：\n{rag_response}\n")
-                        messages.append({"role": "user", "content": [{"type": "text", "text": f"/query {question}"}]})
-                        messages.append({"role": "assistant", "content": [{"type": "text", "text": str(rag_response)}]})
-
+                    # 为Agent提供更明确的指令，引导它使用SQL工具
+                    agent_prompt = f"""
+                    你是一名智能助手。根据用户的问题，如果需要数据库中的信息来回答，请生成并执行正确的SQLite查询语句，然后根据查询结果给出最终答案。如果不需要，就直接回答。
+                    用户问题: {user_input}
+                    """
+                    response = agent_executor.run(agent_prompt)
+                    print(f"\n模型：\n{response}\n")
                 except Exception as e:
-                    print(f"处理文档时出错: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    print(f"Agent执行出错: {e}")
+                    print("抱歉，我暂时无法回答这个问题。")
 
-                continue # 处理完命令后，等待下一次输入
+        except KeyboardInterrupt:
+            print("\n已中断。")
+        finally:
+            # 清理数据库文件
+            if os.path.exists(DB_PATH):
+                os.remove(DB_PATH)
 
-            elif user_input.startswith("/query ") and rag_instance:
-                question = user_input.split(" ", 1)[1].strip()
-                print(f"正在使用 RAG-Anything 查询: {question}")
-                try:
-                    # ---- 修改：使用同步查询方法 ----
-                    # 使用 query 进行知识库查询
-                    rag_response = rag_instance.query(question, mode="hybrid")
-                    print(f"\n模型 (RAG)：\n{rag_response}\n")
-                    # 将 RAG 的回答也加入对话历史
-                    messages.append({"role": "user", "content": [{"type": "text", "text": user_input}]})
-                    messages.append({"role": "assistant", "content": [{"type": "text", "text": str(rag_response)}]})
-                except Exception as e:
-                    if "No LightRAG instance available" in str(e):
-                        print("错误：请先使用 /rag 命令处理至少一个文档后再进行查询。")
-                    else:
-                        print(f"RAG 查询时出错: {e}")
-                        import traceback
-                        traceback.print_exc()
-                continue # 处理完命令后，等待下一次输入
-            # ---- RAG-Anything 命令处理结束 ----
+    return first_reply
 
-            messages.append({"role": "user", "content": [{"type": "text", "text": user_input}]})
-            reply = generate_and_print(messages, max_new_tokens=512)
-            messages.append({"role": "assistant", "content": [{"type": "text", "text": reply}]})
-    except KeyboardInterrupt:
-        print("\n已中断。")
-    return None # 交互模式下，函数结束时没有单一的返回值
 
 def extract_first_paragraph_after_answer(s: str) -> str:
     m = re.search(r'<answer>(.*?)(?:</answer>|$)', s, flags=re.S)
@@ -922,6 +884,13 @@ def eval():
 
 
 if __name__ == "__main__":
+    # # 加载本地图片
+    image_path1 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/rgb_img/3.jpg"
+    image_path2 = "/home/user/xieqiuhao/multimodel_relation/datasets/1-150/thermal_img/3.jpg"
+    # 可选文本；如无则仅图片+提示词
+    # text = None
+    text = "敌方坦克不在战场上"
+    setup_database_from_schema("./test.db")
     processor, model = load_model()
-    chat(image_path1,image_path2,text,processor,model,eval=False)
+    chat(image_path1,image_path2,text,processor, model)
     # eval()
