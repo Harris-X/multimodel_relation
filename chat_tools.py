@@ -21,7 +21,7 @@ from transformers import AutoProcessor, Glm4vForConditionalGeneration
 
 
 MODEL_PATH = "/home/user/xieqiuhao/multimodel_relation/downloaded_model/GLM-4.1V-9B-Thinking"
-DB_PATH = "knowledge_base.db"  # 定义数据库文件路径
+DB_PATH = "./test.db"  # 定义数据库文件路径
 
 
 # --- 新增：LangChain 自定义LLM包装类 ---
@@ -357,7 +357,7 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
 
     # 首轮回答（基于两张图 + 提示词）
     print("检测中，请稍等。")
-    first_reply = generate_and_print(messages, max_new_tokens=5096)
+    # first_reply = generate_and_print(messages, max_new_tokens=2048)
     # --- 核心修改：对话部分集成 LangChain SQL Agent ---
     if not eval:
         print("你可以继续输入文本与模型对话，或询问关于数据库的问题。输入 exit/quit 退出")
@@ -396,8 +396,16 @@ def chat(image1:str, image2:str, text:str, processor, model, eval:bool=True):
                     你是一名智能助手。根据用户的问题，如果需要数据库中的信息来回答，请生成并执行正确的SQLite查询语句，然后根据查询结果给出最终答案。如果不需要，就直接回答。
                     用户问题: {user_input}
                     """
-                    response = agent_executor.run(agent_prompt)
-                    print(f"\n模型：\n{response}\n")
+                    # --- 核心修改 ---
+                    # 1. 使用 .invoke() 而不是 .run()
+                    # 2. 传入一个字典 {"input": ...} 而不是一个字符串
+                    result = agent_executor.invoke({"input": agent_prompt})
+                    
+                    # 3. 从返回的字典中获取 'output' 键的值
+                    response_text = result.get("output", "抱歉，我无法找到答案。")
+                    
+                    print(f"\n模型：\n{response_text}\n")
+                    # --- 修改结束 ---
                 except Exception as e:
                     print(f"Agent执行出错: {e}")
                     print("抱歉，我暂时无法回答这个问题。")
@@ -892,5 +900,5 @@ if __name__ == "__main__":
     text = "敌方坦克不在战场上"
     setup_database_from_schema("./test.db")
     processor, model = load_model()
-    chat(image_path1,image_path2,text,processor, model)
+    chat(image_path1,image_path2,text,processor, model,False)
     # eval()
