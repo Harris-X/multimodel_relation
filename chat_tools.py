@@ -24,8 +24,8 @@ import uuid
 # 从环境变量读取配置
 gpu_id = os.getenv("CUDA_VISIBLE_DEVICES", "0")
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-MODEL_PATH = os.getenv("MODEL_PATH", "/path/to/your/GLM-4.1V-9B-Thinking") # !<-- 请务必修改为你的模型路径
-
+# MODEL_PATH = os.getenv("MODEL_PATH", "/home/user/xieqiuhao/multimodel_relation/downloaded_model/GLM-4.1V-9B-Thinking") # !<-- 请务必修改为你的模型路径
+MODEL_PATH = r"/home/user/xieqiuhao/multimodel_relation/downloaded_model/GLM-4.1V-9B-Thinking"
 # 全局变量,用于在服务启动时加载并持有模型
 model_globals = {
     "processor": None,
@@ -224,7 +224,7 @@ def chat(image1_path: str, image2_path: str, text: str):
     with torch.inference_mode():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=2048,
+            max_new_tokens=5096,
             do_sample=False,
             repetition_penalty=1.05,
         )
@@ -428,4 +428,4 @@ if __name__ == "__main__":
     # 启动FastAPI应用
     # host="0.0.0.0" 使服务可以被局域网内其他机器访问
     # reload=True 会在代码变动时自动重启服务,方便开发调试
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("chat_tools:app", host="0.0.0.0", port=8000, reload=True)
