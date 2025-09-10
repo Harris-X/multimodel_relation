@@ -25,7 +25,7 @@ from torchvision.transforms.functional import InterpolationMode
 
 # 从环境变量读取配置
 # gpu_id = os.getenv("CUDA_VISIBLE_DEVICES", "0")
-# os.environ["CUDA_VISIBLE_DEVICES"] = "6"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 # 不要强行覆盖 CUDA_VISIBLE_DEVICES，交给部署环境配置
 # 修改模型路径
 MODEL_PATH = r"/home/user/xieqiuhao/multimodel_relation/downloaded_model/InternVL3_5-14B"
@@ -133,10 +133,10 @@ def load_model():
     if torch.cuda.is_available():
         model = model.cuda()
     # 思考模式提示词
-    try:
-        model.system_message = R1_SYSTEM_PROMPT
-    except Exception:
-        pass
+    # try:
+    #     model.system_message = R1_SYSTEM_PROMPT
+    # except Exception:
+    #     pass
      
     print("模型加载完成。")
     return tokenizer, model, dtype
@@ -310,8 +310,8 @@ def chat(image1_path: str, image2_path: str, text: str):
 
     # 组装问题串（两个 <image> 必须与 num_patches_list 对齐）
     question = build_initial_messages(prompt, text)
-    print(f"[DEBUG] num_patches_list={num_patches_list}")
-    print(f"[DEBUG] question preview:\n{question[:300]}")
+    # print(f"[DEBUG] num_patches_list={num_patches_list}")
+    # print(f"[DEBUG] question preview:\n{question[:300]}")
 
     generation_config = dict(
         max_new_tokens=2048,
