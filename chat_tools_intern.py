@@ -164,6 +164,8 @@ class UpdateDatasetBody(BaseModel):
     rgb_text_relation: str
     final_relation: str
     accuracy: float
+    consistency_result: str
+    consistency_result_accuracy: float
 
 class ProjectStatusEnum(str, Enum):
     PENDING = "pending"
@@ -177,6 +179,7 @@ class UpdateProjectBody(BaseModel):
     consistency_cognition_accuracy: float
     equivalence_relationship_accuracy: float
     conflict_relationship_accuracy: float
+    causation_relationship_accuracy: float
     relation_accuracy: float
 
 # ==============================================================================
@@ -316,8 +319,8 @@ def chat(image1_path: str, image2_path: str, text: str):
     # print(f"[DEBUG] question preview:\n{question[:300]}")
 
     generation_config = dict(
-        max_new_tokens=2048,
-        do_sample=True,
+        max_new_tokens=1024,
+        do_sample=False,
         temperature=0.6,
         repetition_penalty=1.05
     )
