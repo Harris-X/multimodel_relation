@@ -249,7 +249,7 @@ prompt = (
 图像2-文本1关系:[关系类型]
 
 图像1-图像2-文本1总体关系:矛盾
-综合事实推断:[基于最相关联的两者,得出的一个综合事实结论]
+综合事实推断:[描述最相关联的两者给出的事实结论]
 最相关联的两者是:[图像1和图像2 / 图像1和文本1 / 图像2和文本1]
 信息相斥的模态是:[图像1 / 图像2 / 文本1]
 
@@ -391,6 +391,20 @@ def check_label_re(response:str):
 
     return result
 
+
+# 新增: 提取“综合事实推断”内容
+def extract_overall_inference(text: str) -> Optional[str]:
+    """
+    从模型输出中抽取 '综合事实推断:' 后的单行内容。
+    若未找到返回 None。
+    """
+    # 允许前面有全角/半角冒号
+    m = re.search(r'综合事实推断[:：]\s*(.+)', text)
+    if m:
+        # 截断到该行结束（去掉后续可能的附加说明）
+        return m.group(1).strip()
+    return None
+
 # ==============================================================================
 # 4. API 端点定义
 # ==============================================================================
@@ -472,9 +486,9 @@ async def analyze_consistency(
 
             # 解析模型输出
             parsed_result = check_label_re(model_response)
-            print(f"解析后的关系: {json.dumps(parsed_result, ensure_ascii=False)}")
-            
-            # 从解析结果中提取所需的关系,用于构建回调的body
+            # 新增：抽取综合事实推断
+            overall_inference = extract_overall_inference(model_response)
+
             rels = {
                 tuple(sorted(r["entities"])): r["type"]
                 for r in parsed_result.get("relationships", [])
@@ -485,15 +499,18 @@ async def analyze_consistency(
             rgb_text_key = tuple(sorted(['图片1', '文本1']))
             final_key = tuple(sorted(['图片1', '图片2', '文本1']))
 
-            # 准备回调数据
+            # 如果有综合事实推断则优先使用；否则退回到总体关系标签或默认“一致”
+            consistency_result_value = overall_inference or rels.get(final_key) or "一致"
+
             update_data = UpdateDatasetBody(
                 rgb_infrared_relation=rels.get(rgb_ir_key, "未知"),
                 text_infrared_relation=rels.get(text_ir_key, "未知"),
                 rgb_text_relation=rels.get(rgb_text_key, "未知"),
                 final_relation=rels.get(final_key, "未知"),
-                accuracy=1.0  # 准确率暂时设为1.0,因为单次推理无此概念
+                accuracy=1.0,
+                consistency_result=consistency_result_value,
+                consistency_result_accuracy=1.0
             )
-
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"模型推理或结果解析失败: {e}")
 
@@ -520,6 +537,7 @@ async def analyze_consistency(
         "message": "分析完成并已触发回调",
         "analysis_result": {
             "parsed_relations": parsed_result,
+            "overall_inference": overall_inference,
             "callback_data": update_data.dict(),
             "raw_model_output": model_response
         }
