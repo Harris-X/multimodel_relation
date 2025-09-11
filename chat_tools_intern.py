@@ -18,6 +18,7 @@ import tempfile
 import uuid
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
+from threading import RLock
 
 # ==============================================================================
 # 1. 服务与模型配置
@@ -411,40 +412,49 @@ def extract_overall_inference(text: str) -> Optional[str]:
 
 # --- A. 文档中定义的两个数据更新接口 ---
 
+results_store: dict[tuple[int, int], dict] = {}
+results_lock = RLock()
+
 @app.put(
     "/v1/consistency/infer/{project_id}/{dataset_id}",
     summary="[回调接收] 更新单条数据数据集"
 )
 async def update_single_dataset(project_id: int, dataset_id: int, body: UpdateDatasetBody):
     """
-    **作用**: (模拟)接收算法分析完单条数据后回调的结果,用于更新推导结果和准确率。
+    接收算法分析回调结果并写入内存。
     """
     print(f"--- 接收到回调请求 ---")
-    print(f"项目ID (project_id): {project_id}, 数据集ID (dataset_id): {dataset_id}")
-    print(f"回调内容 (Body): {body.dict()}")
-    print(f"--- 回调处理完毕 ---")
-    
-    # 在实际应用中,这里会执行数据库更新等操作
-    
-    return {"code": 200, "message": "success", "data": None}
+    print(f"项目ID: {project_id}, 数据集ID: {dataset_id}")
+    print(f"回调内容: {body.dict()}")
+    with results_lock:
+        results_store[(project_id, dataset_id)] = {
+            "project_id": project_id,
+            "dataset_id": dataset_id,
+            "data": body.dict()
+        }
+    return {"code": 200, "message": "success", "data": body.dict()}
 
-@app.put(
-    "/v1/consistency/project/{project_id}",
-    summary="[回调接收] 更新任务结果"
+# 新增 GET：查询该 project_id + dataset_id 的最新结果
+@app.get(
+    "/v1/consistency/infer/{project_id}/{dataset_id}",
+    summary="[查询] 获取单条数据最新分析结果"
 )
-async def update_project_status(project_id: int, body: UpdateProjectBody):
-    """
-    **作用**: (模拟)当所有测试数据集的一致性结果都跑完了后调用该接口来更新这一批数据的各项指标。
-    """
-    print(f"--- 接收到任务最终结果更新请求 ---")
-    print(f"项目ID (project_id): {project_id}")
-    print(f"回调内容 (Body): {body.dict()}")
-    print(f"--- 任务更新处理完毕 ---")
+async def get_single_dataset(project_id: int, dataset_id: int):
+    key = (project_id, dataset_id)
+    with results_lock:
+        if key not in results_store:
+            raise HTTPException(status_code=404, detail="结果未找到（可能尚未回调或已重启丢失）。")
+        return {"code": 200, "message": "success", "result": results_store[key]}
 
-    # 在实际应用中,这里会执行数据库更新等操作
-    
-    return {"code": 200, "message": "success", "data": None}
-
+# 可选：按项目列出所有 dataset 结果
+@app.get(
+    "/v1/consistency/infer/{project_id}",
+    summary="[查询] 获取项目下全部结果"
+)
+async def list_project_datasets(project_id: int):
+    with results_lock:
+        items = [v for (pid, _), v in results_store.items() if pid == project_id]
+    return {"code": 200, "count": len(items), "results": items}
 
 # --- B. 新增的、集成了算法的核心分析接口 ---
 
@@ -523,6 +533,7 @@ async def analyze_consistency(
             print(f"正在向 {callback_url} 发送回调...")
             response = await client.put(callback_url, json=update_data.dict())
             response.raise_for_status() # 如果状态码不是 2xx,则会抛出异常
+            callback_resp_json = response.json()
     
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"回调失败: 无法连接到更新接口 at {e.request.url!r}.")
@@ -539,7 +550,8 @@ async def analyze_consistency(
             "parsed_relations": parsed_result,
             "overall_inference": overall_inference,
             "callback_data": update_data.dict(),
-            "raw_model_output": model_response
+            "raw_model_output": model_response,
+            "callback_response": callback_resp_json
         }
     }
 
