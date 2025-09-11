@@ -410,13 +410,67 @@ def extract_overall_inference(text: str) -> Optional[str]:
 # 4. API 端点定义
 # ==============================================================================
 
-# --- A. 文档中定义的两个数据更新接口 ---
+# --- A. 持久化配置与辅助函数 ---
 
-results_store: dict[tuple[int, int], dict] = {}
-results_lock = RLock()
+# 定义持久化文件名
+DATASET_RESULTS_FILE = "dataset_results.csv"
+PROJECT_RESULTS_FILE = "project_results.csv"
+# 文件操作锁
+file_lock = RLock()
 
-# 新增：项目级结果存储
-project_results_store: dict[int, dict] = {}
+def _update_or_append_csv(filepath: str, header: list[str], new_row: dict, key_fields: list[str]):
+    """
+    一个线程安全的函数,用于更新或追加CSV行。
+    如果文件或表头不正确,则会重新创建。
+    """
+    with file_lock:
+        rows = []
+        file_exists = os.path.exists(filepath)
+        header_correct = False
+
+        if file_exists:
+            try:
+                with open(filepath, 'r', newline='', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    # 检查表头
+                    current_header = next(reader)
+                    if current_header == header:
+                        header_correct = True
+                        # 读取所有行到内存
+                        rows = list(csv.DictReader(open(filepath, 'r', newline='', encoding='utf-8')))
+            except (StopIteration, FileNotFoundError, Exception):
+                 # 文件为空或损坏,标记为需要重写
+                header_correct = False
+
+        # 如果文件不存在或表头不匹配,则准备重写
+        if not file_exists or not header_correct:
+            with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+            rows = [] # 清空旧数据
+
+        # 查找是否需要更新
+        key_to_find = {k: str(new_row[k]) for k in key_fields}
+        found_and_updated = False
+        for i, row in enumerate(rows):
+            # 检查主键是否匹配
+            if all(row.get(k) == key_to_find[k] for k in key_fields):
+                rows[i].update(new_row)
+                found_and_updated = True
+                break
+        
+        # 如果没有找到,则追加
+        if not found_and_updated:
+            rows.append(new_row)
+
+        # 将更新后的所有内容写回文件
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=header)
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+# --- B. 文档中定义的两个数据更新接口 ---
 
 @app.put(
     "/v1/consistency/infer/{project_id}/{dataset_id}",
@@ -424,30 +478,35 @@ project_results_store: dict[int, dict] = {}
 )
 async def update_single_dataset(project_id: int, dataset_id: int, body: UpdateDatasetBody):
     """
-    接收算法分析回调结果并写入内存。
+    接收算法分析回调结果并写入CSV文件。
     """
     print(f"--- 接收到回调请求 ---")
     print(f"项目ID: {project_id}, 数据集ID: {dataset_id}")
     print(f"回调内容: {body.dict()}")
-    with results_lock:
-        results_store[(project_id, dataset_id)] = {
-            "project_id": project_id,
-            "dataset_id": dataset_id,
-            "data": body.dict()
-        }
+    
+    header = ["project_id", "dataset_id"] + list(UpdateDatasetBody.__annotations__.keys())
+    new_row = {"project_id": project_id, "dataset_id": dataset_id, **body.dict()}
+    
+    await run_in_threadpool(_update_or_append_csv, DATASET_RESULTS_FILE, header, new_row, ["project_id", "dataset_id"])
+    
     return {"code": 200, "message": "success", "data": body.dict()}
 
-# 新增 GET：查询该 project_id + dataset_id 的最新结果
 @app.get(
     "/v1/consistency/infer/{project_id}/{dataset_id}",
     summary="[查询] 获取单条数据最新分析结果"
 )
 async def get_single_dataset(project_id: int, dataset_id: int):
-    key = (project_id, dataset_id)
-    with results_lock:
-        if key not in results_store:
-            raise HTTPException(status_code=404, detail="结果未找到（可能尚未回调或已重启丢失）。")
-        return {"code": 200, "message": "success", "result": results_store[key]}
+    with file_lock:
+        if not os.path.exists(DATASET_RESULTS_FILE):
+            raise HTTPException(status_code=404, detail="结果文件不存在。")
+        
+        with open(DATASET_RESULTS_FILE, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("project_id") == str(project_id) and row.get("dataset_id") == str(dataset_id):
+                    return {"code": 200, "message": "success", "result": row}
+    
+    raise HTTPException(status_code=404, detail="结果未找到。")
 
 @app.put(
     "/v1/consistency/infer/{project_id}",
@@ -455,37 +514,53 @@ async def get_single_dataset(project_id: int, dataset_id: int):
 )
 async def update_project_summary(project_id: int, body: UpdateProjectBody):
     """
-    接收项目级（汇总统计）回调结果。
-    保存到 project_results_store[project_id]。
+    接收项目级（汇总统计）回调结果并写入CSV文件。
     """
     print(f"--- 接收到项目级回调 ---")
     print(f"项目ID: {project_id}")
     print(f"项目汇总内容: {body.dict()}")
-    with results_lock:
-        project_results_store[project_id] = {
-            "project_id": project_id,
-            "summary": body.dict()
-        }
-    return {"code": 200, "message": "success", "data": project_results_store[project_id]}
 
-# 可选：修改原有按项目列出所有 dataset 结果的接口，加入项目级汇总（若存在）
+    header = ["project_id"] + list(UpdateProjectBody.__annotations__.keys())
+    new_row = {"project_id": project_id, **body.dict()}
+
+    await run_in_threadpool(_update_or_append_csv, PROJECT_RESULTS_FILE, header, new_row, ["project_id"])
+
+    return {"code": 200, "message": "success", "data": new_row}
+
 @app.get(
     "/v1/consistency/infer/{project_id}",
     summary="[查询] 获取项目下全部结果（含项目级汇总）"
 )
 async def list_project_datasets(project_id: int):
-    with results_lock:
-        items = [v for (pid, _), v in results_store.items() if pid == project_id]
-        project_summary = project_results_store.get(project_id)
+    with file_lock:
+        # 读取项目汇总
+        project_summary = None
+        if os.path.exists(PROJECT_RESULTS_FILE):
+            with open(PROJECT_RESULTS_FILE, 'r', newline='', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get("project_id") == str(project_id):
+                        project_summary = row
+                        break
+        
+        # 读取该项目下的所有数据集结果
+        items = []
+        if os.path.exists(DATASET_RESULTS_FILE):
+            with open(DATASET_RESULTS_FILE, 'r', newline='', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get("project_id") == str(project_id):
+                        items.append(row)
+
     return {
         "code": 200,
         "project_id": project_id,
-        "project_summary": project_summary,  # 可能为 None
+        "project_summary": project_summary,
         "count": len(items),
         "results": items
     }
 
-# --- B. 新增的、集成了算法的核心分析接口 ---
+# --- C. 新增的、集成了算法的核心分析接口 ---
 
 @app.post(
     "/v1/consistency/analyze_and_update",
@@ -499,8 +574,8 @@ async def analyze_consistency(
     text: str = Form(...)
 ):
     """
-    **作用**: 接收RGB图像、红外图像和文本,调用GLM-4V模型进行关系分析,
-    然后将分析结果自动回调给 `/v1/consistency/infer/{project_id}/{dataset_id}` 接口。
+    **作用**: 接收RGB图像、红外图像和文本,调用模型进行关系分析,
+    然后将分析结果自动回调给持久化接口。
     """
     # 创建一个临时目录来存放上传的文件
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -525,7 +600,6 @@ async def analyze_consistency(
 
             # 解析模型输出
             parsed_result = check_label_re(model_response)
-            # 新增：抽取综合事实推断
             overall_inference = extract_overall_inference(model_response)
 
             rels = {
@@ -538,7 +612,6 @@ async def analyze_consistency(
             rgb_text_key = tuple(sorted(['图片1', '文本1']))
             final_key = tuple(sorted(['图片1', '图片2', '文本1']))
 
-            # 如果有综合事实推断则优先使用；否则退回到总体关系标签或默认“一致”
             consistency_result_value = overall_inference or rels.get(final_key) or "一致"
 
             update_data = UpdateDatasetBody(
@@ -553,15 +626,12 @@ async def analyze_consistency(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"模型推理或结果解析失败: {e}")
 
-    # 使用 httpx 异步调用回调接口
-    # 注意: 这里的 host 和 port 需要根据你实际部署情况修改
-    # 'http://127.0.0.1:8000' 是 uvicorn 默认的地址
     callback_url = f"http://127.0.0.1:8000/v1/consistency/infer/{project_id}/{dataset_id}"
     try:
         async with httpx.AsyncClient() as client:
             print(f"正在向 {callback_url} 发送回调...")
             response = await client.put(callback_url, json=update_data.dict())
-            response.raise_for_status() # 如果状态码不是 2xx,则会抛出异常
+            response.raise_for_status()
             callback_resp_json = response.json()
     
     except httpx.RequestError as e:
@@ -590,7 +660,4 @@ async def analyze_consistency(
 # ==============================================================================
 
 if __name__ == "__main__":
-    # 启动FastAPI应用
-    # host="0.0.0.0" 使服务可以被局域网内其他机器访问
-    # reload=True 会在代码变动时自动重启服务,方便开发调试
     uvicorn.run("chat_tools_intern:app", host="0.0.0.0", port=8000, reload=True)
