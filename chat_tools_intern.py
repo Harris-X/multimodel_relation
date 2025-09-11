@@ -415,6 +415,9 @@ def extract_overall_inference(text: str) -> Optional[str]:
 results_store: dict[tuple[int, int], dict] = {}
 results_lock = RLock()
 
+# 新增：项目级结果存储
+project_results_store: dict[int, dict] = {}
+
 @app.put(
     "/v1/consistency/infer/{project_id}/{dataset_id}",
     summary="[回调接收] 更新单条数据数据集"
@@ -446,15 +449,41 @@ async def get_single_dataset(project_id: int, dataset_id: int):
             raise HTTPException(status_code=404, detail="结果未找到（可能尚未回调或已重启丢失）。")
         return {"code": 200, "message": "success", "result": results_store[key]}
 
-# 可选：按项目列出所有 dataset 结果
+@app.put(
+    "/v1/consistency/infer/{project_id}",
+    summary="[回调接收] 更新项目级聚合结果"
+)
+async def update_project_summary(project_id: int, body: UpdateProjectBody):
+    """
+    接收项目级（汇总统计）回调结果。
+    保存到 project_results_store[project_id]。
+    """
+    print(f"--- 接收到项目级回调 ---")
+    print(f"项目ID: {project_id}")
+    print(f"项目汇总内容: {body.dict()}")
+    with results_lock:
+        project_results_store[project_id] = {
+            "project_id": project_id,
+            "summary": body.dict()
+        }
+    return {"code": 200, "message": "success", "data": project_results_store[project_id]}
+
+# 可选：修改原有按项目列出所有 dataset 结果的接口，加入项目级汇总（若存在）
 @app.get(
     "/v1/consistency/infer/{project_id}",
-    summary="[查询] 获取项目下全部结果"
+    summary="[查询] 获取项目下全部结果（含项目级汇总）"
 )
 async def list_project_datasets(project_id: int):
     with results_lock:
         items = [v for (pid, _), v in results_store.items() if pid == project_id]
-    return {"code": 200, "count": len(items), "results": items}
+        project_summary = project_results_store.get(project_id)
+    return {
+        "code": 200,
+        "project_id": project_id,
+        "project_summary": project_summary,  # 可能为 None
+        "count": len(items),
+        "results": items
+    }
 
 # --- B. 新增的、集成了算法的核心分析接口 ---
 
