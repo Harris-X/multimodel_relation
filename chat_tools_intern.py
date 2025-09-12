@@ -168,6 +168,7 @@ class UpdateDatasetBody(BaseModel):
     accuracy: float # 检测准确率 1/0 比对 label 标签
     consistency_result: str # 一致性认知结果, 手动创建
     consistency_result_accuracy: float # 一致性认知结果准确率, 手动创建
+    raw_model_output: Optional[str] = None  # 新增：模型原始输出（可选）
 
 class ProjectStatusEnum(str, Enum):
     PENDING = "pending"
@@ -703,8 +704,9 @@ async def analyze_consistency(
                 rgb_text_relation=rels.get(rgb_text_key, "未知"),
                 final_relation=rels.get(final_key, "未知"),
                 accuracy=1.0,
-                consistency_result=consistency_result_value,
-                consistency_result_accuracy=1.0
+                consistency_result=consistency_result_value or "None",
+                consistency_result_accuracy=1.0,
+                raw_model_output=model_response  # 新增：持久化模型原始输出
             )
         except HTTPException:
             raise
@@ -795,7 +797,7 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
 
                     # 推理
                     model_output = await run_in_threadpool(chat, rgb_path, ir_path, text)
-
+                    print(model_output)
                     # 解析
                     parsed = check_label_re(model_output)
                     rels = {tuple(sorted(r["entities"])): r["type"] for r in parsed.get("relationships", [])}
@@ -821,8 +823,9 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                         rgb_text_relation=rels.get(tuple(sorted(['图片1', '文本1'])), "未知"),
                         final_relation=pred or (pred_raw or "未知"),
                         accuracy=sample_acc,
-                        consistency_result=overall_inference,
-                        consistency_result_accuracy=1.0
+                        consistency_result=overall_inference or "None",
+                        consistency_result_accuracy=1.0,
+                        raw_model_output=model_output  # 新增：持久化模型原始输出
                     )
                     header = ["project_id", "dataset_id"] + list(UpdateDatasetBody.__annotations__.keys())
                     new_row = {"project_id": project_id, "dataset_id": dsid, **update_row.dict()}
