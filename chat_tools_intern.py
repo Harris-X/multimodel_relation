@@ -695,7 +695,7 @@ async def analyze_consistency(
             rgb_text_key = tuple(sorted(['图片1', '文本1']))
             final_key = tuple(sorted(['图片1', '图片2', '文本1']))
 
-            consistency_result_value = overall_inference or rels.get(final_key) or "一致"
+            consistency_result_value = overall_inference
 
             update_data = UpdateDatasetBody(
                 rgb_infrared_relation=rels.get(rgb_ir_key, "未知"),
@@ -803,6 +803,9 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                     pred_raw = rels.get(final_key)
                     pred = normalize_relation_name(pred_raw)
 
+                    # 与 analyze_consistency 一致：提取“综合事实推断”文本作为一致性结果
+                    overall_inference = extract_overall_inference(model_output)
+
                     # 计算准确率
                     sample_acc = 0.0
                     if label in _VALID_REL and pred in _VALID_REL:
@@ -818,7 +821,7 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                         rgb_text_relation=rels.get(tuple(sorted(['图片1', '文本1'])), "未知"),
                         final_relation=pred or (pred_raw or "未知"),
                         accuracy=sample_acc,
-                        consistency_result=pred or "未知",
+                        consistency_result=overall_inference or (pred or (pred_raw or "未知")),
                         consistency_result_accuracy=1.0
                     )
                     header = ["project_id", "dataset_id"] + list(UpdateDatasetBody.__annotations__.keys())
