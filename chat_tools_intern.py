@@ -233,7 +233,7 @@ prompt = (
 
 # 执行步骤
 1.  独立分析:
-    - 图像 (每张): 识别主体（如:敌军士兵、坦克）、其明确的行动意图（如:持枪逮捕、道路行进）及场景。分析图像内各主体间的关系。
+    - 图像 (每张): 识别主体（如:敌军士兵、坦克）、其明确的行动意图（如:持枪逮捕、道路行进）及场景，忽略图像对之间主体颜色的不同，分析图像内各主体间的关系。
     - 文本: 提取核心要素,包括时间、地点、人物、事件等细节。
 
 2.  配对关系分析:
@@ -454,6 +454,22 @@ PROJECT_RESULTS_FILE = "project_results.csv"
 # 文件操作锁
 file_lock = RLock()
 
+def _serialize_for_csv(value: Optional[str]) -> str:
+    """
+    将长文本安全序列化为单行，以便写入CSV:
+    - 换行 -> \n
+    - 回车 -> \n
+    - 制表 -> \t
+    - 其余保持原样
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = s.replace("\n", "\\n")
+    s = s.replace("\t", "\\t")
+    return s
+
 def _update_or_append_csv(filepath: str, header: list[str], new_row: dict, key_fields: list[str]):
     """
     一个线程安全的函数,用于更新或追加CSV行。
@@ -505,7 +521,6 @@ def _update_or_append_csv(filepath: str, header: list[str], new_row: dict, key_f
             writer.writeheader()
             writer.writerows(rows)
 
-
 # --- B. 文档中定义的两个数据更新接口 ---
 
 @app.put(
@@ -519,10 +534,14 @@ async def update_single_dataset(project_id: int, dataset_id: int, body: UpdateDa
     print(f"--- 接收到回调请求 ---")
     print(f"项目ID: {project_id}, 数据集ID: {dataset_id}")
     print(f"回调内容: {body.dict()}")
-    
+     
     header = ["project_id", "dataset_id"] + list(UpdateDatasetBody.__annotations__.keys())
-    new_row = {"project_id": project_id, "dataset_id": dataset_id, **body.dict()}
-    
+    body_dict = body.dict()
+    # 序列化原始输出为单行，避免CSV换行干扰
+    if "raw_model_output" in body_dict:
+        body_dict["raw_model_output"] = _serialize_for_csv(body_dict.get("raw_model_output"))
+    new_row = {"project_id": project_id, "dataset_id": dataset_id, **body_dict}
+     
     await run_in_threadpool(_update_or_append_csv, DATASET_RESULTS_FILE, header, new_row, ["project_id", "dataset_id"])
     
     return {"code": 200, "message": "success", "data": body.dict()}
@@ -828,7 +847,9 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                         raw_model_output=model_output  # 新增：持久化模型原始输出
                     )
                     header = ["project_id", "dataset_id"] + list(UpdateDatasetBody.__annotations__.keys())
-                    new_row = {"project_id": project_id, "dataset_id": dsid, **update_row.dict()}
+                    u = update_row.dict()
+                    u["raw_model_output"] = _serialize_for_csv(u.get("raw_model_output"))
+                    new_row = {"project_id": project_id, "dataset_id": dsid, **u}
                     await run_in_threadpool(_update_or_append_csv, DATASET_RESULTS_FILE, header, new_row, ["project_id", "dataset_id"])
 
                     per_item_results.append({"dataset_id": dsid, "label": label or label_raw, "pred": pred or pred_raw or "未知", "accuracy": sample_acc})
