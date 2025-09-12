@@ -599,9 +599,9 @@ async def analyze_consistency(
     dataset_id: int = Form(...),
 
     # 新增：支持路径方式
-    rgb_image_path: Optional[str] = Form(None),
-    infrared_image_path: Optional[str] = Form(None),
-    text_json_path: Optional[str] = Form(None),
+    rgb_image_url: Optional[str] = Form(None),
+    infrared_image_url: Optional[str] = Form(None),
+    text_json_url: Optional[str] = Form(None),
 
     # 兼容原有：文件直传+原始文本
     rgb_image: Optional[UploadFile] = None,
@@ -610,7 +610,7 @@ async def analyze_consistency(
 ):
     """
     支持两种输入：
-    1) 路径方式：rgb_image_path, infrared_image_path, text_json_path(文件中 key='text')
+    1) 路径方式：rgb_image_url, infrared_image_url, text_json_url(文件中 key='text')
     2) 兼容旧方式：rgb_image, infrared_image 文件上传 + text 原文
     优先级：路径字段 > 文件上传/原文。
     """
@@ -618,45 +618,45 @@ async def analyze_consistency(
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
             # 处理 RGB 图像
-            if rgb_image_path:
-                if not os.path.exists(rgb_image_path):
-                    raise HTTPException(status_code=400, detail=f"RGB图像路径不存在: {rgb_image_path}")
-                rgb_path = rgb_image_path
+            if rgb_image_url:
+                if not os.path.exists(rgb_image_url):
+                    raise HTTPException(status_code=400, detail=f"RGB图像路径不存在: {rgb_image_url}")
+                rgb_path = rgb_image_url
             elif rgb_image is not None:
                 rgb_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{rgb_image.filename}")
                 with open(rgb_path, "wb") as f:
                     f.write(await rgb_image.read())
             else:
-                raise HTTPException(status_code=400, detail="缺少 RGB 图像：请提供 rgb_image_path 或上传 rgb_image 文件")
+                raise HTTPException(status_code=400, detail="缺少 RGB 图像：请提供 rgb_image_url 或上传 rgb_image 文件")
 
             # 处理 红外 图像
-            if infrared_image_path:
-                if not os.path.exists(infrared_image_path):
-                    raise HTTPException(status_code=400, detail=f"红外图像路径不存在: {infrared_image_path}")
-                ir_path = infrared_image_path
+            if infrared_image_url:
+                if not os.path.exists(infrared_image_url):
+                    raise HTTPException(status_code=400, detail=f"红外图像路径不存在: {infrared_image_url}")
+                ir_path = infrared_image_url
             elif infrared_image is not None:
                 ir_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{infrared_image.filename}")
                 with open(ir_path, "wb") as f:
                     f.write(await infrared_image.read())
             else:
-                raise HTTPException(status_code=400, detail="缺少红外图像：请提供 infrared_image_path 或上传 infrared_image 文件")
+                raise HTTPException(status_code=400, detail="缺少红外图像：请提供 infrared_image_url 或上传 infrared_image 文件")
 
             # 处理文本：优先从 JSON 路径读取 key='text'
-            if text_json_path:
-                if not os.path.exists(text_json_path):
-                    raise HTTPException(status_code=400, detail=f"文本JSON路径不存在: {text_json_path}")
+            if text_json_url:
+                if not os.path.exists(text_json_url):
+                    raise HTTPException(status_code=400, detail=f"文本JSON路径不存在: {text_json_url}")
                 try:
-                    with open(text_json_path, "r", encoding="utf-8") as jf:
+                    with open(text_json_url, "r", encoding="utf-8") as jf:
                         j = json.load(jf)
                     final_text = j.get("text", "")
                     if not isinstance(final_text, str) or not final_text.strip():
-                        raise HTTPException(status_code=400, detail=f"文本JSON中未找到有效的 'text' 字段: {text_json_path}")
+                        raise HTTPException(status_code=400, detail=f"文本JSON中未找到有效的 'text' 字段: {text_json_url}")
                 except json.JSONDecodeError as je:
                     raise HTTPException(status_code=400, detail=f"文本JSON解析失败: {je}")
             elif text is not None:
                 final_text = text
             else:
-                raise HTTPException(status_code=400, detail="缺少文本：请提供 text_json_path 或 text 原文")
+                raise HTTPException(status_code=400, detail="缺少文本：请提供 text_json_url 或 text 原文")
 
         except HTTPException:
             raise
@@ -717,7 +717,7 @@ async def analyze_consistency(
     return {
         "code": 200,
         "message": "分析完成并已触发回调",
-        "analysis_result": {
+        "result": {
             "parsed_relations": parsed_result,
             "overall_inference": overall_inference,
             "callback_data": update_data.dict(),
@@ -727,7 +727,7 @@ async def analyze_consistency(
     }
 
 @app.post(
-    "/v1/consistency/infer/{project_id}",
+    "/v1/consistency/batch_analyze",
     summary="[算法执行] 批量分析项目数据并写入项目级汇总/样本结果"
 )
 async def batch_infer_project(project_id: int, body: BatchInferBody):
