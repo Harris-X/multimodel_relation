@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 # ==============================================================================
 
 # 从环境变量读取配置
-# gpu_id = os.getenv("CUDA_VISIBLE_DEVICES", "0")
+# gpu_id = os.getenv("CUDA_VISIBLE_DEVICES", "3")
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 # 不要强行覆盖 CUDA_VISIBLE_DEVICES，交给部署环境配置
 # 修改模型路径
@@ -161,13 +161,13 @@ app = FastAPI(
 
 # --- Pydantic 模型定义 ---
 class UpdateDatasetBody(BaseModel):
-    rgb_infrared_relation: str
-    text_infrared_relation: str
-    rgb_text_relation: str
-    final_relation: str
-    accuracy: float
-    consistency_result: str
-    consistency_result_accuracy: float
+    rgb_infrared_relation: str # rgb 和红外的关系
+    text_infrared_relation: str # 文本 和红外的关系
+    rgb_text_relation: str # rgb 和文本的关系
+    final_relation: str # 最终关系
+    accuracy: float # 检测准确率 1/0 比对 label 标签
+    consistency_result: str # 一致性认知结果, 手动创建
+    consistency_result_accuracy: float # 一致性认知结果准确率, 手动创建
 
 class ProjectStatusEnum(str, Enum):
     PENDING = "pending"
@@ -240,7 +240,7 @@ prompt = (
     - 图像1 - 图像2
     - 图像1 - 文本1
     - 图像2 - 文本1
-    - 每组关系必须从【等价、关联、因果、矛盾】四种类型中选择一种。
+    - 每组关系必须从【等价、关联、因果、矛盾】四种关系类型中选择一种。
 
 3.  总体关系判定:
     - 综合上述三组配对关系,对【图像1-图像2-文本1】给出一个总体的关系判定,同样从四种类型中选择。
@@ -743,20 +743,6 @@ async def analyze_consistency(
     summary="[算法执行] 批量分析项目数据并写入项目级汇总/样本结果"
 )
 async def batch_infer_project(project_id: int, body: BatchInferBody):
-    """
-    请求体示例:
-    {
-      "project_id": 1,
-      "datasets": [
-        {
-          "dataset_id": "3",
-          "rgb_image_url": "http://.../r.jpg",
-          "infrared_image_url": "http://.../i.jpg",
-          "text_url": "http://.../3.json"   # json 内含 { "text": "...", "label": "等价" }
-        }
-      ]
-    }
-    """
     if body.project_id is not None and int(body.project_id) != int(project_id):
         raise HTTPException(status_code=400, detail="路径中的 project_id 与 body 不一致。")
 
@@ -863,7 +849,13 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
     )
     proj_header = ["project_id"] + list(UpdateProjectBody.__annotations__.keys())
     proj_row = {"project_id": project_id, **proj_body.dict()}
-    await run_in_threadpool(_update_or_append_csv, PROJECT_RESULTS_FILE, proj_header, proj_row, ["project_id"])
+
+    # 新增：通过 HTTP PUT 回调项目级接口
+    callback_url = f"http://127.0.0.1:8000/v1/consistency/infer/{project_id}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.put(callback_url, json=proj_body.dict())
+        resp.raise_for_status()
+        callback_resp_json = resp.json()
 
     # 返回项目级结果 + 每条样本简要
     return {
@@ -871,7 +863,8 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
         "message": "批量分析完成，结果已写入项目与样本CSV。",
         "project_summary": proj_row,
         "items": per_item_results,
-        "errors": errors
+        "errors": errors,
+        "project_callback_response": callback_resp_json  # 可选：返回回调响应
     }
 
 
