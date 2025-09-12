@@ -19,6 +19,7 @@ import uuid
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
 from threading import RLock
+from urllib.parse import urlparse
 
 # ==============================================================================
 # 1. 服务与模型配置
@@ -197,7 +198,7 @@ class BatchInferBody(BaseModel):
 # ---------------- 新增：关系归一化工具 ----------------
 _REL_SYNONYMS = {
     "相同": "等价", "一致": "等价", "相符": "等价",
-    "相关": "关联", "联系": "关联", "有关": "关联",
+    "相关": "关联", "联系": "关联",
     "冲突": "矛盾", "相斥": "矛盾", "相悖": "矛盾", "相矛盾": "矛盾",
     "因果关系": "因果"
 }
@@ -210,6 +211,12 @@ def normalize_relation_name(name: str) -> Optional[str]:
     s = re.sub(r'关系$', '', s)
     s = _REL_SYNONYMS.get(s, s)
     return s if s in _VALID_REL else None
+
+def is_http_url(s: Optional[str]) -> bool:
+    try:
+        return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://"))
+    except Exception:
+        return False
 
 # ==============================================================================
 # 3. 原始算法核心逻辑 (稍作修改以适应服务)
@@ -598,66 +605,71 @@ async def analyze_consistency(
     project_id: int = Form(...),
     dataset_id: int = Form(...),
 
-    # 新增：支持路径方式
+    # 现在既支持 http(s) URL 也支持服务器本地路径
     rgb_image_url: Optional[str] = Form(None),
     infrared_image_url: Optional[str] = Form(None),
     text_json_url: Optional[str] = Form(None),
 
-    # 兼容原有：文件直传+原始文本
+    # 兼容：文件直传 + 原始文本
     rgb_image: Optional[UploadFile] = None,
     infrared_image: Optional[UploadFile] = None,
     text: Optional[str] = Form(None),
 ):
-    """
-    支持两种输入：
-    1) 路径方式：rgb_image_url, infrared_image_url, text_json_url(文件中 key='text')
-    2) 兼容旧方式：rgb_image, infrared_image 文件上传 + text 原文
-    优先级：路径字段 > 文件上传/原文。
-    """
-    # 创建一个临时目录（用于保存上传文件；若走路径则直接使用原路径）
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
-            # 处理 RGB 图像
-            if rgb_image_url:
-                if not os.path.exists(rgb_image_url):
-                    raise HTTPException(status_code=400, detail=f"RGB图像路径不存在: {rgb_image_url}")
-                rgb_path = rgb_image_url
-            elif rgb_image is not None:
-                rgb_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{rgb_image.filename}")
-                with open(rgb_path, "wb") as f:
-                    f.write(await rgb_image.read())
-            else:
-                raise HTTPException(status_code=400, detail="缺少 RGB 图像：请提供 rgb_image_url 或上传 rgb_image 文件")
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                # RGB
+                if rgb_image_url:
+                    if is_http_url(rgb_image_url):
+                        resp = await client.get(rgb_image_url); resp.raise_for_status()
+                        rgb_path = os.path.join(temp_dir, f"{uuid.uuid4()}_rgb.jpg")
+                        with open(rgb_path, "wb") as f: f.write(resp.content)
+                    else:
+                        if not os.path.exists(rgb_image_url):
+                            raise HTTPException(status_code=400, detail=f"RGB图像路径不存在: {rgb_image_url}")
+                        rgb_path = rgb_image_url
+                elif rgb_image is not None:
+                    rgb_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{rgb_image.filename}")
+                    with open(rgb_path, "wb") as f: f.write(await rgb_image.read())
+                else:
+                    raise HTTPException(status_code=400, detail="缺少 RGB 图像：请提供 rgb_image_url 或上传 rgb_image 文件")
 
-            # 处理 红外 图像
-            if infrared_image_url:
-                if not os.path.exists(infrared_image_url):
-                    raise HTTPException(status_code=400, detail=f"红外图像路径不存在: {infrared_image_url}")
-                ir_path = infrared_image_url
-            elif infrared_image is not None:
-                ir_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{infrared_image.filename}")
-                with open(ir_path, "wb") as f:
-                    f.write(await infrared_image.read())
-            else:
-                raise HTTPException(status_code=400, detail="缺少红外图像：请提供 infrared_image_url 或上传 infrared_image 文件")
+                # IR
+                if infrared_image_url:
+                    if is_http_url(infrared_image_url):
+                        resp = await client.get(infrared_image_url); resp.raise_for_status()
+                        ir_path = os.path.join(temp_dir, f"{uuid.uuid4()}_ir.jpg")
+                        with open(ir_path, "wb") as f: f.write(resp.content)
+                    else:
+                        if not os.path.exists(infrared_image_url):
+                            raise HTTPException(status_code=400, detail=f"红外图像路径不存在: {infrared_image_url}")
+                        ir_path = infrared_image_url
+                elif infrared_image is not None:
+                    ir_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{infrared_image.filename}")
+                    with open(ir_path, "wb") as f: f.write(await infrared_image.read())
+                else:
+                    raise HTTPException(status_code=400, detail="缺少红外图像：请提供 infrared_image_url 或上传 infrared_image 文件")
 
-            # 处理文本：优先从 JSON 路径读取 key='text'
-            if text_json_url:
-                if not os.path.exists(text_json_url):
-                    raise HTTPException(status_code=400, detail=f"文本JSON路径不存在: {text_json_url}")
-                try:
-                    with open(text_json_url, "r", encoding="utf-8") as jf:
-                        j = json.load(jf)
-                    final_text = j.get("text", "")
-                    if not isinstance(final_text, str) or not final_text.strip():
-                        raise HTTPException(status_code=400, detail=f"文本JSON中未找到有效的 'text' 字段: {text_json_url}")
-                except json.JSONDecodeError as je:
-                    raise HTTPException(status_code=400, detail=f"文本JSON解析失败: {je}")
-            elif text is not None:
-                final_text = text
-            else:
-                raise HTTPException(status_code=400, detail="缺少文本：请提供 text_json_url 或 text 原文")
-
+                # 文本
+                if text_json_url:
+                    if is_http_url(text_json_url):
+                        t_resp = await client.get(text_json_url); t_resp.raise_for_status()
+                        try:
+                            j = t_resp.json()
+                        except Exception:
+                            j = {"text": t_resp.text}
+                    else:
+                        if not os.path.exists(text_json_url):
+                            raise HTTPException(status_code=400, detail=f"文本JSON路径不存在: {text_json_url}")
+                        with open(text_json_url, "r", encoding="utf-8") as jf:
+                            j = json.load(jf)
+                    final_text = (j.get("text") or "").strip()
+                    if not final_text:
+                        raise HTTPException(status_code=400, detail=f"文本JSON中未找到有效的 'text' 字段")
+                elif text is not None:
+                    final_text = text
+                else:
+                    raise HTTPException(status_code=400, detail="缺少文本：请提供 text_json_url 或 text 原文")
         except HTTPException:
             raise
         except Exception as e:
@@ -748,53 +760,52 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
     if body.project_id is not None and int(body.project_id) != int(project_id):
         raise HTTPException(status_code=400, detail="路径中的 project_id 与 body 不一致。")
 
-    # 统计容器
     cls_total = {c: 0 for c in _VALID_REL}
     cls_correct = {c: 0 for c in _VALID_REL}
+    per_item_results, errors = [], []
 
-    per_item_results = []
-    errors = []
-
-    # 下载 + 推理
     async with httpx.AsyncClient(timeout=60.0) as client:
         with tempfile.TemporaryDirectory() as temp_dir:
             for item in body.datasets:
                 dsid = str(item.dataset_id)
                 try:
-                    # 下载两张图
-                    rgb_bytes = (await client.get(item.rgb_image_url)).raise_for_status() or (await client.get(item.rgb_image_url)).content
-                    ir_bytes = (await client.get(item.infrared_image_url)).raise_for_status() or (await client.get(item.infrared_image_url)).content
-                    # 实际需要先请求一次再取 content，写成两步以保证 raise_for_status 已调用
-                    rgb_resp = await client.get(item.rgb_image_url)
-                    rgb_resp.raise_for_status()
-                    rgb_bytes = rgb_resp.content
+                    # RGB
+                    if is_http_url(item.rgb_image_url):
+                        r = await client.get(item.rgb_image_url); r.raise_for_status()
+                        rgb_path = os.path.join(temp_dir, f"{uuid.uuid4()}_rgb.jpg")
+                        with open(rgb_path, "wb") as f: f.write(r.content)
+                    else:
+                        if not os.path.exists(item.rgb_image_url):
+                            raise HTTPException(status_code=400, detail=f"{dsid}: RGB路径不存在: {item.rgb_image_url}")
+                        rgb_path = item.rgb_image_url
 
-                    ir_resp = await client.get(item.infrared_image_url)
-                    ir_resp.raise_for_status()
-                    ir_bytes = ir_resp.content
+                    # IR
+                    if is_http_url(item.infrared_image_url):
+                        r = await client.get(item.infrared_image_url); r.raise_for_status()
+                        ir_path = os.path.join(temp_dir, f"{uuid.uuid4()}_ir.jpg")
+                        with open(ir_path, "wb") as f: f.write(r.content)
+                    else:
+                        if not os.path.exists(item.infrared_image_url):
+                            raise HTTPException(status_code=400, detail=f"{dsid}: 红外路径不存在: {item.infrared_image_url}")
+                        ir_path = item.infrared_image_url
 
-                    rgb_path = os.path.join(temp_dir, f"{uuid.uuid4()}_rgb.jpg")
-                    ir_path = os.path.join(temp_dir, f"{uuid.uuid4()}_ir.jpg")
-                    with open(rgb_path, "wb") as f:
-                        f.write(rgb_bytes)
-                    with open(ir_path, "wb") as f:
-                        f.write(ir_bytes)
-
-                    # 下载文本 JSON
-                    txt_resp = await client.get(item.text_url)
-                    txt_resp.raise_for_status()
-                    try:
-                        j = txt_resp.json()
-                    except Exception:
-                        # 兼容纯文本文件的场景
-                        j = {"text": txt_resp.text}
+                    # 文本 JSON
+                    if is_http_url(item.text_url):
+                        t = await client.get(item.text_url); t.raise_for_status()
+                        try:
+                            j = t.json()
+                        except Exception:
+                            j = {"text": t.text}
+                    else:
+                        if not os.path.exists(item.text_url):
+                            raise HTTPException(status_code=400, detail=f"{dsid}: 文本JSON路径不存在: {item.text_url}")
+                        with open(item.text_url, "r", encoding="utf-8") as jf:
+                            j = json.load(jf)
                     text = (j.get("text") or "").strip()
                     label_raw = (j.get("label") or "").strip()
                     label = normalize_relation_name(label_raw)
                     if not text:
-                        raise HTTPException(status_code=400, detail=f"数据集 {dsid}: 文本JSON缺少有效 'text'")
-                    # 允许无 label，但无法计入准确率
-                    # label 可为 None
+                        raise HTTPException(status_code=400, detail=f"{dsid}: 文本JSON缺少有效 'text'")
 
                     # 推理
                     model_output = await run_in_threadpool(chat, rgb_path, ir_path, text)
@@ -806,7 +817,7 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                     pred_raw = rels.get(final_key)
                     pred = normalize_relation_name(pred_raw)
 
-                    # 计算单样本准确率（若有标签且预测有效）
+                    # 计算准确率
                     sample_acc = 0.0
                     if label in _VALID_REL and pred in _VALID_REL:
                         cls_total[label] += 1
@@ -814,7 +825,7 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                             cls_correct[label] += 1
                             sample_acc = 1.0
 
-                    # 写入样本 CSV（沿用你已有的列定义）
+                    # 写入样本 CSV
                     update_row = UpdateDatasetBody(
                         rgb_infrared_relation=rels.get(tuple(sorted(['图片1', '图片2'])), "未知"),
                         text_infrared_relation=rels.get(tuple(sorted(['文本1', '图片2'])), "未知"),
@@ -822,29 +833,18 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                         final_relation=pred or (pred_raw or "未知"),
                         accuracy=sample_acc,
                         consistency_result=pred or "未知",
-                        consistency_result_accuracy=1.0  # 占位
+                        consistency_result_accuracy=1.0
                     )
                     header = ["project_id", "dataset_id"] + list(UpdateDatasetBody.__annotations__.keys())
                     new_row = {"project_id": project_id, "dataset_id": dsid, **update_row.dict()}
                     await run_in_threadpool(_update_or_append_csv, DATASET_RESULTS_FILE, header, new_row, ["project_id", "dataset_id"])
 
-                    per_item_results.append({
-                        "dataset_id": dsid,
-                        "label": label or label_raw,
-                        "pred": pred or pred_raw or "未知",
-                        "accuracy": sample_acc
-                    })
-
+                    per_item_results.append({"dataset_id": dsid, "label": label or label_raw, "pred": pred or pred_raw or "未知", "accuracy": sample_acc})
                 except Exception as e:
                     errors.append({"dataset_id": dsid, "error": str(e)})
 
-    # 计算项目级准确率
-    per_class_acc = {}
-    for c in _VALID_REL:
-        n = cls_total[c]
-        per_class_acc[c] = (cls_correct[c] / n) if n > 0 else None
-
-    # 宏平均（跳过没有样本的类别）
+    # 统计项目级
+    per_class_acc = {c: (cls_correct[c] / cls_total[c]) if cls_total[c] > 0 else None for c in _VALID_REL}
     valid_accs = [v for v in per_class_acc.values() if v is not None]
     infer_relation_accuracy = sum(valid_accs) / len(valid_accs) if valid_accs else 0.0
 
@@ -856,10 +856,10 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
         status=ProjectStatusEnum.COMPLETED,
         infer_relation_accuracy=infer_relation_accuracy,
         consistency_cognition_accuracy=consistency_cognition_accuracy,
-        equivalence_relationship_accuracy=per_class_acc["等价"] if per_class_acc["等价"] is not None else 0.0,
-        conflict_relationship_accuracy=per_class_acc["矛盾"] if per_class_acc["矛盾"] is not None else 0.0,
-        causation_relationship_accuracy=per_class_acc["因果"] if per_class_acc["因果"] is not None else 0.0,
-        relation_accuracy=per_class_acc["关联"] if per_class_acc["关联"] is not None else 0.0
+        equivalence_relationship_accuracy=per_class_acc["等价"] or 0.0,
+        conflict_relationship_accuracy=per_class_acc["矛盾"] or 0.0,
+        causation_relationship_accuracy=per_class_acc["因果"] or 0.0,
+        relation_accuracy=per_class_acc["关联"] or 0.0
     )
     proj_header = ["project_id"] + list(UpdateProjectBody.__annotations__.keys())
     proj_row = {"project_id": project_id, **proj_body.dict()}
