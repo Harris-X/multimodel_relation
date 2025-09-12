@@ -821,7 +821,7 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                         rgb_text_relation=rels.get(tuple(sorted(['图片1', '文本1'])), "未知"),
                         final_relation=pred or (pred_raw or "未知"),
                         accuracy=sample_acc,
-                        consistency_result=overall_inference or (pred or (pred_raw or "未知")),
+                        consistency_result=overall_inference,
                         consistency_result_accuracy=1.0
                     )
                     header = ["project_id", "dataset_id"] + list(UpdateDatasetBody.__annotations__.keys())
