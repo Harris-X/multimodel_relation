@@ -176,12 +176,40 @@ class ProjectStatusEnum(str, Enum):
 
 class UpdateProjectBody(BaseModel):
     status: ProjectStatusEnum
-    infer_relation_accuracy: float
-    consistency_cognition_accuracy: float
-    equivalence_relationship_accuracy: float
-    conflict_relationship_accuracy: float
-    causation_relationship_accuracy: float
-    relation_accuracy: float
+    infer_relation_accuracy: float # 总体推演关系准确率
+    consistency_cognition_accuracy: float # 一致性认知准确率
+    equivalence_relationship_accuracy: float # 等价关系准确率
+    conflict_relationship_accuracy: float # 矛盾关系准确率
+    causation_relationship_accuracy: float # 因果关系准确率
+    relation_accuracy: float # 关联关系准确率
+
+# ---------------- 新增：批量请求体定义 ----------------
+class DatasetItem(BaseModel):
+    dataset_id: str
+    rgb_image_url: str
+    infrared_image_url: str
+    text_url: str  # 指向 JSON，内部含 key='text' 和 'label'
+
+class BatchInferBody(BaseModel):
+    project_id: Optional[int] = None
+    datasets: list[DatasetItem]
+
+# ---------------- 新增：关系归一化工具 ----------------
+_REL_SYNONYMS = {
+    "相同": "等价", "一致": "等价", "相符": "等价",
+    "相关": "关联", "联系": "关联", "有关": "关联",
+    "冲突": "矛盾", "相斥": "矛盾", "相悖": "矛盾", "相矛盾": "矛盾",
+    "因果关系": "因果"
+}
+_VALID_REL = {"等价", "关联", "因果", "矛盾"}
+
+def normalize_relation_name(name: str) -> Optional[str]:
+    if not name:
+        return None
+    s = re.sub(r'[。；;,,！!？?\s]+$', '', name.strip())
+    s = re.sub(r'关系$', '', s)
+    s = _REL_SYNONYMS.get(s, s)
+    return s if s in _VALID_REL else None
 
 # ==============================================================================
 # 3. 原始算法核心逻辑 (稍作修改以适应服务)
@@ -569,33 +597,76 @@ async def list_project_datasets(project_id: int):
 async def analyze_consistency(
     project_id: int = Form(...),
     dataset_id: int = Form(...),
-    rgb_image: UploadFile = Form(...),
-    infrared_image: UploadFile = Form(...),
-    text: str = Form(...)
+
+    # 新增：支持路径方式
+    rgb_image_path: Optional[str] = Form(None),
+    infrared_image_path: Optional[str] = Form(None),
+    text_json_path: Optional[str] = Form(None),
+
+    # 兼容原有：文件直传+原始文本
+    rgb_image: Optional[UploadFile] = None,
+    infrared_image: Optional[UploadFile] = None,
+    text: Optional[str] = Form(None),
 ):
     """
-    **作用**: 接收RGB图像、红外图像和文本,调用模型进行关系分析,
-    然后将分析结果自动回调给持久化接口。
+    支持两种输入：
+    1) 路径方式：rgb_image_path, infrared_image_path, text_json_path(文件中 key='text')
+    2) 兼容旧方式：rgb_image, infrared_image 文件上传 + text 原文
+    优先级：路径字段 > 文件上传/原文。
     """
-    # 创建一个临时目录来存放上传的文件
+    # 创建一个临时目录（用于保存上传文件；若走路径则直接使用原路径）
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
-            # 保存上传的图片到临时文件
-            rgb_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{rgb_image.filename}")
-            with open(rgb_path, "wb") as f:
-                f.write(await rgb_image.read())
+            # 处理 RGB 图像
+            if rgb_image_path:
+                if not os.path.exists(rgb_image_path):
+                    raise HTTPException(status_code=400, detail=f"RGB图像路径不存在: {rgb_image_path}")
+                rgb_path = rgb_image_path
+            elif rgb_image is not None:
+                rgb_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{rgb_image.filename}")
+                with open(rgb_path, "wb") as f:
+                    f.write(await rgb_image.read())
+            else:
+                raise HTTPException(status_code=400, detail="缺少 RGB 图像：请提供 rgb_image_path 或上传 rgb_image 文件")
 
-            ir_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{infrared_image.filename}")
-            with open(ir_path, "wb") as f:
-                f.write(await infrared_image.read())
+            # 处理 红外 图像
+            if infrared_image_path:
+                if not os.path.exists(infrared_image_path):
+                    raise HTTPException(status_code=400, detail=f"红外图像路径不存在: {infrared_image_path}")
+                ir_path = infrared_image_path
+            elif infrared_image is not None:
+                ir_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{infrared_image.filename}")
+                with open(ir_path, "wb") as f:
+                    f.write(await infrared_image.read())
+            else:
+                raise HTTPException(status_code=400, detail="缺少红外图像：请提供 infrared_image_path 或上传 infrared_image 文件")
 
+            # 处理文本：优先从 JSON 路径读取 key='text'
+            if text_json_path:
+                if not os.path.exists(text_json_path):
+                    raise HTTPException(status_code=400, detail=f"文本JSON路径不存在: {text_json_path}")
+                try:
+                    with open(text_json_path, "r", encoding="utf-8") as jf:
+                        j = json.load(jf)
+                    final_text = j.get("text", "")
+                    if not isinstance(final_text, str) or not final_text.strip():
+                        raise HTTPException(status_code=400, detail=f"文本JSON中未找到有效的 'text' 字段: {text_json_path}")
+                except json.JSONDecodeError as je:
+                    raise HTTPException(status_code=400, detail=f"文本JSON解析失败: {je}")
+            elif text is not None:
+                final_text = text
+            else:
+                raise HTTPException(status_code=400, detail="缺少文本：请提供 text_json_path 或 text 原文")
+
+        except HTTPException:
+            raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"文件保存失败: {e}")
+            raise HTTPException(status_code=500, detail=f"输入处理失败: {e}")
 
         try:
             # 在线程池中运行耗时的模型推理
             print(f"开始为 project:{project_id} dataset:{dataset_id} 进行模型推理...")
-            model_response = await run_in_threadpool(chat, rgb_path, ir_path, text)
+            model_response = await run_in_threadpool(chat, rgb_path, ir_path, final_text)
             print(f"模型推理完成。原始输出: \n{model_response}")
 
             # 解析模型输出
@@ -623,6 +694,8 @@ async def analyze_consistency(
                 consistency_result=consistency_result_value,
                 consistency_result_accuracy=1.0
             )
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"模型推理或结果解析失败: {e}")
 
@@ -633,7 +706,6 @@ async def analyze_consistency(
             response = await client.put(callback_url, json=update_data.dict())
             response.raise_for_status()
             callback_resp_json = response.json()
-    
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"回调失败: 无法连接到更新接口 at {e.request.url!r}.")
     except httpx.HTTPStatusError as e:
@@ -652,6 +724,154 @@ async def analyze_consistency(
             "raw_model_output": model_response,
             "callback_response": callback_resp_json
         }
+    }
+
+@app.post(
+    "/v1/consistency/infer/{project_id}",
+    summary="[算法执行] 批量分析项目数据并写入项目级汇总/样本结果"
+)
+async def batch_infer_project(project_id: int, body: BatchInferBody):
+    """
+    请求体示例:
+    {
+      "project_id": 1,
+      "datasets": [
+        {
+          "dataset_id": "3",
+          "rgb_image_url": "http://.../r.jpg",
+          "infrared_image_url": "http://.../i.jpg",
+          "text_url": "http://.../3.json"   # json 内含 { "text": "...", "label": "等价" }
+        }
+      ]
+    }
+    """
+    if body.project_id is not None and int(body.project_id) != int(project_id):
+        raise HTTPException(status_code=400, detail="路径中的 project_id 与 body 不一致。")
+
+    # 统计容器
+    cls_total = {c: 0 for c in _VALID_REL}
+    cls_correct = {c: 0 for c in _VALID_REL}
+
+    per_item_results = []
+    errors = []
+
+    # 下载 + 推理
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for item in body.datasets:
+                dsid = str(item.dataset_id)
+                try:
+                    # 下载两张图
+                    rgb_bytes = (await client.get(item.rgb_image_url)).raise_for_status() or (await client.get(item.rgb_image_url)).content
+                    ir_bytes = (await client.get(item.infrared_image_url)).raise_for_status() or (await client.get(item.infrared_image_url)).content
+                    # 实际需要先请求一次再取 content，写成两步以保证 raise_for_status 已调用
+                    rgb_resp = await client.get(item.rgb_image_url)
+                    rgb_resp.raise_for_status()
+                    rgb_bytes = rgb_resp.content
+
+                    ir_resp = await client.get(item.infrared_image_url)
+                    ir_resp.raise_for_status()
+                    ir_bytes = ir_resp.content
+
+                    rgb_path = os.path.join(temp_dir, f"{uuid.uuid4()}_rgb.jpg")
+                    ir_path = os.path.join(temp_dir, f"{uuid.uuid4()}_ir.jpg")
+                    with open(rgb_path, "wb") as f:
+                        f.write(rgb_bytes)
+                    with open(ir_path, "wb") as f:
+                        f.write(ir_bytes)
+
+                    # 下载文本 JSON
+                    txt_resp = await client.get(item.text_url)
+                    txt_resp.raise_for_status()
+                    try:
+                        j = txt_resp.json()
+                    except Exception:
+                        # 兼容纯文本文件的场景
+                        j = {"text": txt_resp.text}
+                    text = (j.get("text") or "").strip()
+                    label_raw = (j.get("label") or "").strip()
+                    label = normalize_relation_name(label_raw)
+                    if not text:
+                        raise HTTPException(status_code=400, detail=f"数据集 {dsid}: 文本JSON缺少有效 'text'")
+                    # 允许无 label，但无法计入准确率
+                    # label 可为 None
+
+                    # 推理
+                    model_output = await run_in_threadpool(chat, rgb_path, ir_path, text)
+
+                    # 解析
+                    parsed = check_label_re(model_output)
+                    rels = {tuple(sorted(r["entities"])): r["type"] for r in parsed.get("relationships", [])}
+                    final_key = tuple(sorted(['图片1', '图片2', '文本1']))
+                    pred_raw = rels.get(final_key)
+                    pred = normalize_relation_name(pred_raw)
+
+                    # 计算单样本准确率（若有标签且预测有效）
+                    sample_acc = 0.0
+                    if label in _VALID_REL and pred in _VALID_REL:
+                        cls_total[label] += 1
+                        if pred == label:
+                            cls_correct[label] += 1
+                            sample_acc = 1.0
+
+                    # 写入样本 CSV（沿用你已有的列定义）
+                    update_row = UpdateDatasetBody(
+                        rgb_infrared_relation=rels.get(tuple(sorted(['图片1', '图片2'])), "未知"),
+                        text_infrared_relation=rels.get(tuple(sorted(['文本1', '图片2'])), "未知"),
+                        rgb_text_relation=rels.get(tuple(sorted(['图片1', '文本1'])), "未知"),
+                        final_relation=pred or (pred_raw or "未知"),
+                        accuracy=sample_acc,
+                        consistency_result=pred or "未知",
+                        consistency_result_accuracy=1.0  # 占位
+                    )
+                    header = ["project_id", "dataset_id"] + list(UpdateDatasetBody.__annotations__.keys())
+                    new_row = {"project_id": project_id, "dataset_id": dsid, **update_row.dict()}
+                    await run_in_threadpool(_update_or_append_csv, DATASET_RESULTS_FILE, header, new_row, ["project_id", "dataset_id"])
+
+                    per_item_results.append({
+                        "dataset_id": dsid,
+                        "label": label or label_raw,
+                        "pred": pred or pred_raw or "未知",
+                        "accuracy": sample_acc
+                    })
+
+                except Exception as e:
+                    errors.append({"dataset_id": dsid, "error": str(e)})
+
+    # 计算项目级准确率
+    per_class_acc = {}
+    for c in _VALID_REL:
+        n = cls_total[c]
+        per_class_acc[c] = (cls_correct[c] / n) if n > 0 else None
+
+    # 宏平均（跳过没有样本的类别）
+    valid_accs = [v for v in per_class_acc.values() if v is not None]
+    infer_relation_accuracy = sum(valid_accs) / len(valid_accs) if valid_accs else 0.0
+
+    # 一致性认知准确率：按你的要求先置为 1
+    consistency_cognition_accuracy = 1.0
+
+    # 写入项目级 CSV
+    proj_body = UpdateProjectBody(
+        status=ProjectStatusEnum.COMPLETED,
+        infer_relation_accuracy=infer_relation_accuracy,
+        consistency_cognition_accuracy=consistency_cognition_accuracy,
+        equivalence_relationship_accuracy=per_class_acc["等价"] if per_class_acc["等价"] is not None else 0.0,
+        conflict_relationship_accuracy=per_class_acc["矛盾"] if per_class_acc["矛盾"] is not None else 0.0,
+        causation_relationship_accuracy=per_class_acc["因果"] if per_class_acc["因果"] is not None else 0.0,
+        relation_accuracy=per_class_acc["关联"] if per_class_acc["关联"] is not None else 0.0
+    )
+    proj_header = ["project_id"] + list(UpdateProjectBody.__annotations__.keys())
+    proj_row = {"project_id": project_id, **proj_body.dict()}
+    await run_in_threadpool(_update_or_append_csv, PROJECT_RESULTS_FILE, proj_header, proj_row, ["project_id"])
+
+    # 返回项目级结果 + 每条样本简要
+    return {
+        "code": 200,
+        "message": "批量分析完成，结果已写入项目与样本CSV。",
+        "project_summary": proj_row,
+        "items": per_item_results,
+        "errors": errors
     }
 
 
