@@ -381,7 +381,7 @@ def chat(image1_path: str, image2_path: str, text: str):
         )
 
         with torch.inference_mode():
-            response, _ = model.chat(
+            chat_ret = model.chat(
                 tokenizer=tokenizer,
                 pixel_values=pixel_values,
                 question=question,
@@ -390,6 +390,11 @@ def chat(image1_path: str, image2_path: str, text: str):
                 history=None,
                 return_history=False   # 关闭历史返回，减少内存保留
             )
+        # 兼容返回签名：可能是 str 或 (str, history)
+        if isinstance(chat_ret, tuple):
+            response = chat_ret[0]
+        else:
+            response = chat_ret
         return response
     finally:
         try:
