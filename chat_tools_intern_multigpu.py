@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 # 可在启动前导出:  export CUDA_VISIBLE_DEVICES=0,1,2
 # os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # <- 删除这类硬编码
 # 修改模型路径
-MODEL_PATH = r"/home/user/xieqiuhao/multimodel_relation/downloaded_model/InternVL3_5-14B"
+MODEL_PATH = r"/root/autodl-tmp/multimodel_relation/downloaded_model/InternVL3_5-14B"
 # 全局变量,用于在服务启动时加载并持有模型
 model_globals = {
     "tokenizer": None,
@@ -109,7 +109,7 @@ def load_image(image_file: str, input_size=448, max_num=12) -> torch.Tensor:
 # ==============================================================================
 
 def load_model():
-    """加载模型与处理器到全局变量（多卡自动切分）"""
+    """加载模型与处理器到全局变量（多卡自动分片）"""
     print("开始加载模型...")
     if not os.path.isdir(MODEL_PATH):
         raise RuntimeError(f"模型路径不存在: {MODEL_PATH}。请检查 MODEL_PATH 环境变量或代码中的路径。")
@@ -337,10 +337,19 @@ def build_initial_messages(instruction_prompt: str, user_text: str | None):
     content += instruction_prompt
     return content
 
+def _first_cuda_device_from_hf_map(model) -> torch.device:
+    # 从 hf_device_map 找到第一块 CUDA 设备，避免固定用 cuda:0
+    devs = getattr(model, "hf_device_map", None)
+    if isinstance(devs, dict):
+        for v in devs.values():
+            if isinstance(v, str) and v.startswith("cuda:"):
+                return torch.device(v)
+            if isinstance(v, int):
+                return torch.device(f"cuda:{v}")
+    # 回退
+    return torch.device("cuda:0")
+
 def chat(image1_path: str, image2_path: str, text: str):
-    """
-    模型推理函数,接收文件路径和文本,返回模型的原始输出。
-    """
     tokenizer = model_globals["tokenizer"]
     model = model_globals["model"]
     in_dtype = model_globals.get("dtype", torch.bfloat16)
@@ -349,17 +358,23 @@ def chat(image1_path: str, image2_path: str, text: str):
 
     pixel_values = None
     try:
-        pixel_values1 = load_image(image1_path, max_num=12)
+        pixel_values1 = load_image(image1_path, max_num=12)   # 可酌情降为 8/6 以减小激活
         pixel_values2 = load_image(image2_path, max_num=12)
         num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
         pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
 
-        # 多卡场景：把输入放在 cuda:0（第一块卡）即可；加速框架会在内部跨卡执行
         if torch.cuda.is_available():
-            pixel_values = pixel_values.to(torch.device("cuda:0"), non_blocking=True)
+            dev0 = _first_cuda_device_from_hf_map(model)
+            # 把输入直接放到模型首块 GPU，避免先到 cuda:0 再搬运
+            pixel_values = pixel_values.to(dev0, non_blocking=True)
 
         question = build_initial_messages(prompt, text)
-        generation_config = dict(max_new_tokens=1024, do_sample=False, temperature=0.6, repetition_penalty=1.05)
+        generation_config = dict(
+            max_new_tokens=768,   # 适度调低生成长度可明显降显存峰值
+            do_sample=False,
+            temperature=0.6,
+            repetition_penalty=1.05
+        )
 
         with torch.inference_mode():
             response, _ = model.chat(
@@ -369,11 +384,10 @@ def chat(image1_path: str, image2_path: str, text: str):
                 generation_config=generation_config,
                 num_patches_list=num_patches_list,
                 history=None,
-                return_history=True
+                return_history=False   # 关闭历史返回，减少内存保留
             )
         return response
     finally:
-        # 显存清理
         try:
             del pixel_values1, pixel_values2
         except Exception:
