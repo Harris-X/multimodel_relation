@@ -224,7 +224,7 @@ def is_http_url(s: Optional[str]) -> bool:
 # ==============================================================================
 prompt = (
 """# 角色与任务
-你是一名专精于多模态信息分析的军事情报分析师。你的核心任务是精准分析给定的两张军事图像和一段军事文本之间的关系。
+你是一名专精于多模态信息分析的军事情报分析师。当前你的核心任务是精准分析给定的两张军事图像和一段军事文本之间的关系。
 
 # 输入信息
 - 图像1(RGB图像)
@@ -334,45 +334,44 @@ def chat(image1_path: str, image2_path: str, text: str):
     """
     模型推理函数,接收文件路径和文本,返回模型的原始输出。
     """
-    # 从全局变量获取模型
     tokenizer = model_globals["tokenizer"]
     model = model_globals["model"]
     in_dtype = model_globals.get("dtype", torch.bfloat16)
-
     if not tokenizer or not model:
         raise RuntimeError("模型尚未加载。")
 
-    # 载入并切片两张图像
-    pixel_values1 = load_image(image1_path, max_num=12)
-    pixel_values2 = load_image(image2_path, max_num=12)
-    num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
-    pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
-    if torch.cuda.is_available():
-        pixel_values = pixel_values.cuda(non_blocking=True)
+    pixel_values = None
+    try:
+        # 载入并切片两张图像
+        pixel_values1 = load_image(image1_path, max_num=12)
+        pixel_values2 = load_image(image2_path, max_num=12)
+        num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
+        pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
+        if torch.cuda.is_available():
+            pixel_values = pixel_values.cuda(non_blocking=True)
 
-    # 组装问题串（两个 <image> 必须与 num_patches_list 对齐）
-    question = build_initial_messages(prompt, text)
-    # print(f"[DEBUG] num_patches_list={num_patches_list}")
-    # print(f"[DEBUG] question preview:\n{question[:300]}")
+        question = build_initial_messages(prompt, text)
+        generation_config = dict(max_new_tokens=1024, do_sample=False, temperature=0.6, repetition_penalty=1.05)
 
-    generation_config = dict(
-        max_new_tokens=1024,
-        do_sample=False,
-        temperature=0.6,
-        repetition_penalty=1.05
-    )
-
-    # 使用 InternVL 的 .chat
-    response, _ = model.chat(
-        tokenizer=tokenizer,
-        pixel_values=pixel_values,
-        question=question,
-        generation_config=generation_config,
-        num_patches_list=num_patches_list,
-        history=None,
-        return_history=True
-    )
-    return response
+        # 关键：无梯度/推理模式，减少显存占用
+        with torch.inference_mode():
+            response, _ = model.chat(
+                tokenizer=tokenizer,
+                pixel_values=pixel_values,
+                question=question,
+                generation_config=generation_config,
+                num_patches_list=num_patches_list,
+                history=None,
+                return_history=True
+            )
+        return response
+    finally:
+        # 释放中间张量，缓解长批次 OOM
+        del pixel_values1, pixel_values2
+        if pixel_values is not None:
+            del pixel_values
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 def extract_first_paragraph_after_answer(s: str) -> str:
     # 思考模式会产生 <think>...</think> 块，答案在后面
@@ -699,7 +698,7 @@ async def analyze_consistency(
             # 在线程池中运行耗时的模型推理
             print(f"开始为 project:{project_id} dataset:{dataset_id} 进行模型推理...")
             model_response = await run_in_threadpool(chat, rgb_path, ir_path, final_text)
-            print(f"模型推理完成。原始输出: \n{model_response}")
+            # print(f"模型推理完成。原始输出: \n{model_response}")
 
             # 解析模型输出
             parsed_result = check_label_re(model_response)
@@ -771,11 +770,12 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
     cls_correct = {c: 0 for c in _VALID_REL}
     per_item_results, errors = [], []
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:  # 拉长总超时
         with tempfile.TemporaryDirectory() as temp_dir:
             for item in body.datasets:
                 dsid = str(item.dataset_id)
                 try:
+                    print(f"[BATCH] 开始处理 dataset_id={dsid}")
                     # RGB
                     if is_http_url(item.rgb_image_url):
                         r = await client.get(item.rgb_image_url); r.raise_for_status()
@@ -816,7 +816,7 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
 
                     # 推理
                     model_output = await run_in_threadpool(chat, rgb_path, ir_path, text)
-                    print(model_output)
+                    # print(model_output)
                     # 解析
                     parsed = check_label_re(model_output)
                     rels = {tuple(sorted(r["entities"])): r["type"] for r in parsed.get("relationships", [])}
@@ -853,8 +853,14 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                     await run_in_threadpool(_update_or_append_csv, DATASET_RESULTS_FILE, header, new_row, ["project_id", "dataset_id"])
 
                     per_item_results.append({"dataset_id": dsid, "label": label or label_raw, "pred": pred or pred_raw or "未知", "accuracy": sample_acc})
+                    print(f"[BATCH] 完成推理 dataset_id={dsid}，写入CSV")
                 except Exception as e:
-                    errors.append({"dataset_id": dsid, "error": str(e)})
+                    # 打印完整错误到控制台
+                    import traceback
+                    err = f"{type(e).__name__}: {e}"
+                    print(f"[BATCH][ERROR] dataset_id={dsid} -> {err}\n{traceback.format_exc()}")
+                    errors.append({"dataset_id": dsid, "error": err})
+                    continue
 
     # 统计项目级
     per_class_acc = {c: (cls_correct[c] / cls_total[c]) if cls_total[c] > 0 else None for c in _VALID_REL}
@@ -891,7 +897,12 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
         "project_summary": proj_row,
         "items": per_item_results,
         "errors": errors,
-        "project_callback_response": callback_resp_json  # 可选：返回回调响应
+        "stats": {  # 新增简单统计，便于脚本端判断
+            "total": len(body.datasets),
+            "success": len(per_item_results),
+            "failed": len(errors)
+        },
+        "project_callback_response": callback_resp_json
     }
 
 
