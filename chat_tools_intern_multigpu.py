@@ -342,15 +342,25 @@ def build_initial_messages(instruction_prompt: str, user_text: str | None):
     return content
 
 def _first_cuda_device_from_hf_map(model) -> torch.device:
-    # 从 hf_device_map 找到第一块 CUDA 设备，避免固定用 cuda:0
     devs = getattr(model, "hf_device_map", None)
     if isinstance(devs, dict):
+        # 优先找视觉塔所在设备，避免把图像激活都塞到 cuda:0
+        def _to_dev(v):
+            if isinstance(v, str) and v.startswith("cuda:"): return torch.device(v)
+            if isinstance(v, int): return torch.device(f"cuda:{v}")
+            return None
+        # 常见关键词
+        vis_keys = ["vision", "visual", "image", "vit", "projector"]
+        for k, v in devs.items():
+            if any(t in k.lower() for t in vis_keys):
+                d = _to_dev(v)
+                if d is not None:
+                    return d
+        # 找到第一个 cuda:* 即可
         for v in devs.values():
-            if isinstance(v, str) and v.startswith("cuda:"):
-                return torch.device(v)
-            if isinstance(v, int):
-                return torch.device(f"cuda:{v}")
-    # 回退
+            d = _to_dev(v)
+            if d is not None:
+                return d
     return torch.device("cuda:0")
 
 def chat(image1_path: str, image2_path: str, text: str):
