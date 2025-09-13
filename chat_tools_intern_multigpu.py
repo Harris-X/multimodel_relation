@@ -123,7 +123,7 @@ def load_model():
         dtype = torch.float32
 
     # 多卡配置：device_map 与 max_memory
-    device_map = os.environ.get("HF_DEVICE_MAP", "auto")  # 可设: auto / balanced / balanced_low_0 / sequential
+    device_map = os.environ.get("HF_DEVICE_MAP", "balanced")  # 强制均衡分片；需要时可改回 auto
     # 每卡可用显存比例，默认 0.9，可通过 GPU_MEM_FRACTION=0.85 覆盖
     mem_fraction = float(os.environ.get("GPU_MEM_FRACTION", "0.9"))
     max_memory = None
@@ -145,7 +145,11 @@ def load_model():
         device_map=device_map,        # 关键：自动分片
         max_memory=max_memory         # 关键：限制每卡占用
     ).eval()
-
+    # 打印分片结果，便于确认使用了哪些 GPU
+    try:
+        print("hf_device_map:", getattr(model, "hf_device_map", None))
+    except Exception:
+        pass
     # 注意：不要再调用 model.cuda()，否则会把模型挪到单卡
     print("模型加载完成（多GPU）")
     return tokenizer, model, dtype
@@ -935,4 +939,5 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
 # ==============================================================================
 
 if __name__ == "__main__":
-    uvicorn.run("chat_tools_intern:app", host="0.0.0.0", port=8000, reload=True)
+    # 确保启动的是本文件的多卡应用
+    uvicorn.run("chat_tools_intern_multigpu:app", host="0.0.0.0", port=8000, reload=True)
