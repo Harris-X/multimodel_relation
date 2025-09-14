@@ -125,7 +125,7 @@ def load_model():
     # 多卡配置：device_map 与 max_memory
     device_map = os.environ.get("HF_DEVICE_MAP", "balanced")  # 强制均衡分片；需要时可改回 auto
     # 每卡可用显存比例，默认 0.9，可通过 GPU_MEM_FRACTION=0.85 覆盖
-    mem_fraction = float(os.environ.get("GPU_MEM_FRACTION", "0.9"))
+    mem_fraction = float(os.environ.get("GPU_MEM_FRACTION", "1.0"))
     max_memory = None
     if torch.cuda.is_available():
         max_memory = {}
@@ -139,7 +139,7 @@ def load_model():
     model = AutoModel.from_pretrained(
         MODEL_PATH,
         torch_dtype=dtype,
-        low_cpu_mem_usage=True,
+        low_cpu_mem_usage=False,  # 关闭低内存模式以支持多卡
         use_flash_attn=True,
         trust_remote_code=True,
         device_map=device_map,        # 关键：自动分片
@@ -248,7 +248,6 @@ prompt = ("""
 3.  **总体判定**: 综合配对分析结果，给出【图像1-图像2-文本1】的总体关系。判定遵循**最高优先级原则：矛盾 > 因果 > 关联 > 等价**。
 
 # 分析准则
-
   - **内容优先**: 忽略模态差异（如RGB与红外成像），只关注语义内容。假定两张图片描述的是同一场景。红外图像中的红黄色代表热量，不代表着火。
   - **主体一致**: 分析时需兼容同义词（如“坦克”与“装甲车”），但不能混淆不同主体（如“坦克”与“工程车”）。所有信息均针对敌方。
   - **论证严谨**: 结论必须明确，禁止使用“可能”、“似乎”等模糊词汇。论证需引用数量、行为等具体细节支撑。
@@ -312,25 +311,15 @@ def build_initial_messages(instruction_prompt: str, user_text: str | None):
     return content
 
 def _first_cuda_device_from_hf_map(model) -> torch.device:
+    # 从 hf_device_map 找到第一块 CUDA 设备，避免固定用 cuda:0
     devs = getattr(model, "hf_device_map", None)
     if isinstance(devs, dict):
-        # 优先找视觉塔所在设备，避免把图像激活都塞到 cuda:0
-        def _to_dev(v):
-            if isinstance(v, str) and v.startswith("cuda:"): return torch.device(v)
-            if isinstance(v, int): return torch.device(f"cuda:{v}")
-            return None
-        # 常见关键词
-        vis_keys = ["vision", "visual", "image", "vit", "projector"]
-        for k, v in devs.items():
-            if any(t in k.lower() for t in vis_keys):
-                d = _to_dev(v)
-                if d is not None:
-                    return d
-        # 找到第一个 cuda:* 即可
         for v in devs.values():
-            d = _to_dev(v)
-            if d is not None:
-                return d
+            if isinstance(v, str) and v.startswith("cuda:"):
+                return torch.device(v)
+            if isinstance(v, int):
+                return torch.device(f"cuda:{v}")
+    # 回退
     return torch.device("cuda:0")
 
 def chat(image1_path: str, image2_path: str, text: str):
@@ -342,8 +331,8 @@ def chat(image1_path: str, image2_path: str, text: str):
 
     pixel_values = None
     try:
-        pixel_values1 = load_image(image1_path, max_num=12)   # 可酌情降为 8/6 以减小激活
-        pixel_values2 = load_image(image2_path, max_num=12)
+        pixel_values1 = load_image(image1_path, max_num=8)   # 可酌情降为 8/6 以减小激活
+        pixel_values2 = load_image(image2_path, max_num=6)
         num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
         pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
 
@@ -354,7 +343,7 @@ def chat(image1_path: str, image2_path: str, text: str):
 
         question = build_initial_messages(prompt, text)
         generation_config = dict(
-            max_new_tokens=768,   # 适度调低生成长度可明显降显存峰值
+            max_new_tokens=512,   # 适度调低生成长度可明显降显存峰值
             do_sample=False,
             temperature=0.6,
             repetition_penalty=1.05
