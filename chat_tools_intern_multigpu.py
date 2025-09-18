@@ -953,4 +953,4 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
 
 if __name__ == "__main__":
     # 确保启动的是本文件的多卡应用
-    uvicorn.run("chat_tools_intern_multigpu:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("chat_tools_intern_multigpu:app", host="0.0.0.0", port=8002, reload=True)
