@@ -686,6 +686,9 @@ async def analyze_consistency(
                         with open(text_json_url, "r", encoding="utf-8") as jf:
                             j = json.load(jf)
                     final_text = (j.get("text") or "").strip()
+                    consistency_result_label = (j.get("label") or "").strip()
+                    label_raw = (j.get("label") or "").strip()
+                    label = normalize_relation_name(label_raw)
                     if not final_text:
                         raise HTTPException(status_code=400, detail=f"文本JSON中未找到有效的 'text' 字段")
                 elif text is not None:
@@ -716,17 +719,30 @@ async def analyze_consistency(
             text_ir_key = tuple(sorted(['文本1', '图片2']))
             rgb_text_key = tuple(sorted(['图片1', '文本1']))
             final_key = tuple(sorted(['图片1', '图片2', '文本1']))
+            pred_raw = rels.get(final_key)
+            pred = normalize_relation_name(pred_raw)
 
             consistency_result_value = overall_inference
+            if consistency_result_label == overall_inference:
+                consistency_result_accuracy=1.0
+            else:
+                consistency_result_accuracy=0.0
+
+            if pred ==  label and label is not None:
+                accuracy = 1.0
+            else:
+                accuracy = 0.0
+
+            
 
             update_data = UpdateDatasetBody(
                 rgb_infrared_relation=rels.get(rgb_ir_key, "未知"),
                 text_infrared_relation=rels.get(text_ir_key, "未知"),
                 rgb_text_relation=rels.get(rgb_text_key, "未知"),
                 final_relation=rels.get(final_key, "未知"),
-                accuracy=1.0,
+                accuracy=accuracy,
                 consistency_result=consistency_result_value or "None",
-                consistency_result_accuracy=1.0,
+                consistency_result_accuracy=consistency_result_accuracy,
                 raw_model_output=model_response  # 新增：持久化模型原始输出
             )
         except HTTPException:
@@ -813,6 +829,7 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                             j = json.load(jf)
                     text = (j.get("text") or "").strip()
                     label_raw = (j.get("label") or "").strip()
+                    consistency_result_label = (j.get("consistency_result") or "").strip()
                     label = normalize_relation_name(label_raw)
                     if not text:
                         raise HTTPException(status_code=400, detail=f"{dsid}: 文本JSON缺少有效 'text'")
@@ -838,6 +855,11 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                             cls_correct[label] += 1
                             sample_acc = 1.0
 
+                    if consistency_result_label == overall_inference:
+                        consistency_result_accuracy=1.0
+                    else:
+                        consistency_result_accuracy=0.0
+
                     # 写入样本 CSV
                     update_row = UpdateDatasetBody(
                         rgb_infrared_relation=rels.get(tuple(sorted(['图片1', '图片2'])), "未知"),
@@ -846,7 +868,7 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                         final_relation=pred or (pred_raw or "未知"),
                         accuracy=sample_acc,
                         consistency_result=overall_inference or "None",
-                        consistency_result_accuracy=1.0,
+                        consistency_result_accuracy=consistency_result_accuracy,
                         raw_model_output=model_output  # 新增：持久化模型原始输出
                     )
                     header = ["project_id", "dataset_id"] + list(UpdateDatasetBody.__annotations__.keys())
