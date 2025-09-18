@@ -198,7 +198,7 @@ class UpdateProjectBody(BaseModel):
 
 # ---------------- 新增：批量请求体定义 ----------------
 class DatasetItem(BaseModel):
-    dataset_id: str
+    dataset_id: int
     rgb_image_url: str
     infrared_image_url: str
     text_url: str  # 指向 JSON，内部含 key='text' 和 'label'
@@ -734,7 +734,7 @@ async def analyze_consistency(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"模型推理或结果解析失败: {e}")
 
-    callback_url = f"http://127.0.0.1:8000/v1/consistency/infer/{project_id}/{dataset_id}"
+    callback_url = f"http://121.48.162.151:18000/v1/consistency/infer/{project_id}/{dataset_id}"
     try:
         async with httpx.AsyncClient() as client:
             print(f"正在向 {callback_url} 发送回调...")
@@ -857,6 +857,22 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
 
                     per_item_results.append({"dataset_id": dsid, "label": label or label_raw, "pred": pred or pred_raw or "未知", "accuracy": sample_acc})
                     print(f"[BATCH] 完成推理 dataset_id={dsid}，写入CSV")
+
+                    base = "http://121.48.162.151:18000"
+                    callback_url = f"{base}/v1/consistency/infer/{project_id}/{dsid}"
+                    try:
+                        # 复用外层 client，避免覆盖导致已关闭的 client 被使用
+                        print(f"正在向 {callback_url} 发送回调...")
+                        response = await client.put(callback_url, json=update_row.dict())
+                        response.raise_for_status()
+                        callback_resp_json = response.json()
+                    except httpx.RequestError as e:
+                        raise HTTPException(status_code=502, detail=f"回调失败: 无法连接到更新接口 at {e.request.url!r}.")
+                    except httpx.HTTPStatusError as e:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"回调接口返回错误: {e.response.status_code} - {e.response.text}"
+                        )
                 except Exception as e:
                     # 打印完整错误到控制台
                     import traceback
@@ -887,7 +903,7 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
     proj_row = {"project_id": project_id, **proj_body.dict()}
 
     # 新增：通过 HTTP PUT 回调项目级接口
-    callback_url = f"http://127.0.0.1:8000/v1/consistency/infer/{project_id}"
+    callback_url = f"http://121.48.162.151:18000/v1/consistency/infer/{project_id}"
     async with httpx.AsyncClient() as client:
         resp = await client.put(callback_url, json=proj_body.dict())
         resp.raise_for_status()
