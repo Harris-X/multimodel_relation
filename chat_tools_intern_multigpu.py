@@ -1039,11 +1039,7 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
     )
     proj_header = ["project_id"] + list(UpdateProjectBody.__annotations__.keys())
     proj_row = {"project_id": project_id, **proj_body.dict()}
-    header = ["project_id", "dataset_id"] + list(UpdateDatasetBody.__annotations__.keys())
-    u = proj_body.dict()
-    u["raw_model_output"] = _serialize_for_csv(u.get("raw_model_output"))
-    new_row = {"project_id": project_id, "dataset_id": dsid, **u}
-    await run_in_threadpool(_update_or_append_csv, PROJECT_RESULTS_FILE, header, new_row, ["project_id", "dataset_id"])
+    await run_in_threadpool(_update_or_append_csv, PROJECT_RESULTS_FILE, proj_header, proj_row, ["project_id"])
 
     # 新增：通过 HTTP PUT 回调项目级接口
     callback_url = f"{base_url}/v1/consistency/infer/{project_id}"
