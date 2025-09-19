@@ -536,8 +536,9 @@ def _load_existing_update_rows(project_id: int, dataset_ids: list[str]) -> dict[
             with open(DATASET_RESULTS_FILE, 'r', newline='', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    # if row.get("project_id") != str(project_id):
-                    #     continue
+                    # 仅读取当前项目的数据，避免串项目
+                    if row.get("project_id") != str(project_id):
+                        continue
                     dsid = row.get("dataset_id")
                     if dsid not in wanted:
                         continue
@@ -955,18 +956,14 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
         print(f"[BATCH] 已缓存 dataset_id={key}")
         callback_url = f"{base_url}/v1/consistency/infer/{project_id}/{dataset_id}"
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 print(f"正在向 {callback_url} 发送回调...")
                 response = await client.put(callback_url, json=update_data.dict())
                 response.raise_for_status()
-                callback_resp_json = response.json()
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"回调失败: 无法连接到更新接口 at {e.request.url!r}.")
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"回调接口返回错误: {e.response.status_code} - {e.response.text}"
-            )
+                _ = response.json()
+        except Exception as e:
+            # 降级为日志，避免中断整个批任务
+            print(f"[BATCH][WARN] 缓存样本回调失败 dataset_id={dataset_id}: {e}")
     # 2) 找出未命中的，按需同步推理
     pending_items = [it for it in body.datasets if str(it.dataset_id) not in existing_map]
     ran_count = 0
@@ -987,36 +984,40 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
             continue
         items.append({"dataset_id": dsid, **b.dict()})
     
-    for item in body.datasets:
-        dsid = str(item.dataset_id)
-        b = existing_map.get(dsid)
+    # 读取每条样本的标签与一致性结果标签，用于项目级统计
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        for item in body.datasets:
+            dsid = str(item.dataset_id)
+            b = existing_map.get(dsid)
 
-        # 文本 JSON
-        if is_http_url(item.text_url):
-            t = await client.get(item.text_url); t.raise_for_status()
-            try:
-                j = t.json()
-            except Exception:
-                j = {"text": t.text}
-        else:
-            if not os.path.exists(item.text_url):
-                raise HTTPException(status_code=400, detail=f"{dsid}: 文本JSON路径不存在: {item.text_url}")
-            with open(item.text_url, "r", encoding="utf-8") as jf:
-                j = json.load(jf)
+            # 文本 JSON
+            if is_http_url(item.text_url):
+                t = await client.get(item.text_url); t.raise_for_status()
+                try:
+                    j = t.json()
+                except Exception:
+                    j = {"text": t.text}
+            else:
+                if not os.path.exists(item.text_url):
+                    print(f"[BATCH][WARN] 文本JSON路径不存在: {item.text_url}")
+                    j = {}
+                else:
+                    with open(item.text_url, "r", encoding="utf-8") as jf:
+                        j = json.load(jf)
 
 
-        consistency_result_label = (j.get("consistency_result") or "").strip()
+            consistency_result_label = (j.get("consistency_result") or "").strip() if isinstance(j, dict) else ""
 
-        label = b.actual_relation if b else None
-        pred = b.final_relation if b else None
-        consistency_result = b.consistency_result.strip() if b else None
-        # 计算准确率
-        if label in _VALID_REL and pred in _VALID_REL:
-            cls_total[label] += 1
-            if pred == label:
-                cls_correct[label] += 1
-        if consistency_result_label == consistency_result:
-            consistency_cognition_accuracy += 1
+            label = b.actual_relation if b else None
+            pred = b.final_relation if b else None
+            consistency_result = (b.consistency_result or "").strip() if b else None
+            # 计算准确率
+            if label in _VALID_REL and pred in _VALID_REL:
+                cls_total[label] += 1
+                if pred == label:
+                    cls_correct[label] += 1
+            if consistency_result_label and consistency_result_label == consistency_result:
+                consistency_cognition_accuracy += 1
 
 
 
