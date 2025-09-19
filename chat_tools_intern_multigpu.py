@@ -27,9 +27,9 @@ from urllib.parse import urlparse
 
 # 从环境变量读取配置（不要在代码里强行覆盖 CUDA_VISIBLE_DEVICES）
 # 可在启动前导出:  export CUDA_VISIBLE_DEVICES=0,1,2
-# os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # <- 删除这类硬编码
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # <- 删除这类硬编码
 # 修改模型路径
-MODEL_PATH = r"/root/autodl-tmp/multimodel_relation/downloaded_model/InternVL3_5-14B"
+MODEL_PATH = r"/home/user/xieqiuhao/multimodel_relation/downloaded_model/InternVL3_5-14B"
 # 全局变量,用于在服务启动时加载并持有模型
 model_globals = {
     "tokenizer": None,
@@ -523,6 +523,47 @@ def _update_or_append_csv(filepath: str, header: list[str], new_row: dict, key_f
             writer.writeheader()
             writer.writerows(rows)
 
+# 从本地 CSV 读取指定项目与数据集的已存在结果，转换成 UpdateDatasetBody
+def _load_existing_update_rows(project_id: int, dataset_ids: list[str]) -> dict[str, UpdateDatasetBody]:
+    result: dict[str, UpdateDatasetBody] = {}
+    if not os.path.exists(DATASET_RESULTS_FILE):
+        return result
+    wanted = set(dataset_ids)
+    with file_lock:
+        try:
+            with open(DATASET_RESULTS_FILE, 'r', newline='', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # if row.get("project_id") != str(project_id):
+                    #     continue
+                    dsid = row.get("dataset_id")
+                    if dsid not in wanted:
+                        continue
+                    # 构建 UpdateDatasetBody
+                    try:
+                        acc = float(row.get("accuracy", 0) or 0)
+                    except Exception:
+                        acc = 0.0
+                    try:
+                        cra = float(row.get("consistency_result_accuracy", 0) or 0)
+                    except Exception:
+                        cra = 0.0
+                    body = UpdateDatasetBody(
+                        rgb_infrared_relation=row.get("rgb_infrared_relation", "未知"),
+                        text_infrared_relation=row.get("text_infrared_relation", "未知"),
+                        rgb_text_relation=row.get("rgb_text_relation", "未知"),
+                        final_relation=row.get("final_relation", "未知"),
+                        accuracy=acc,
+                        consistency_result=row.get("consistency_result", "None"),
+                        consistency_result_accuracy=cra,
+                        raw_model_output=row.get("raw_model_output")
+                    )
+                    result[dsid] = body
+        except Exception:
+            # 读取异常则视为无缓存
+            return {}
+    return result
+
 # --- B. 文档中定义的两个数据更新接口 ---
 
 @app.put(
@@ -750,7 +791,7 @@ async def analyze_consistency(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"模型推理或结果解析失败: {e}")
 
-    callback_url = f"http://121.48.162.151:18000/v1/consistency/infer/{project_id}/{dataset_id}"
+    callback_url = f"http://10.13.31.103:7000/v1/consistency/infer/{project_id}/{dataset_id}"
     try:
         async with httpx.AsyncClient() as client:
             print(f"正在向 {callback_url} 发送回调...")
@@ -777,14 +818,10 @@ async def analyze_consistency(
         }
     }
 
-@app.post(
-    "/v1/consistency/batch_analyze",
-    summary="[算法执行] 批量分析项目数据并写入项目级汇总/样本结果"
-)
-async def batch_infer_project(project_id: int, body: BatchInferBody):
-    if body.project_id is not None and int(body.project_id) != int(project_id):
-        raise HTTPException(status_code=400, detail="路径中的 project_id 与 body 不一致。")
 
+
+async def run_batch_infer_project(project_id: int, body: BatchInferBody):
+    print(f"[BATCH] 后台任务启动 project_id={project_id}, 样本数={len(body.datasets)}")
     cls_total = {c: 0 for c in _VALID_REL}
     cls_correct = {c: 0 for c in _VALID_REL}
     per_item_results, errors = [], []
@@ -880,7 +917,7 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
                     per_item_results.append({"dataset_id": dsid, "label": label or label_raw, "pred": pred or pred_raw or "未知", "accuracy": sample_acc})
                     print(f"[BATCH] 完成推理 dataset_id={dsid}，写入CSV")
 
-                    base = "http://121.48.162.151:18000"
+                    base = "http://10.13.31.103:7000"
                     callback_url = f"{base}/v1/consistency/infer/{project_id}/{dsid}"
                     try:
                         # 复用外层 client，避免覆盖导致已关闭的 client 被使用
@@ -925,25 +962,103 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
     proj_row = {"project_id": project_id, **proj_body.dict()}
 
     # 新增：通过 HTTP PUT 回调项目级接口
-    callback_url = f"http://121.48.162.151:18000/v1/consistency/infer/{project_id}"
+    callback_url = f"http://10.13.31.103:7000/v1/consistency/infer/{project_id}"
     async with httpx.AsyncClient() as client:
         resp = await client.put(callback_url, json=proj_body.dict())
         resp.raise_for_status()
         callback_resp_json = resp.json()
+    print(f"[BATCH] 项目级回调完成 project_id={project_id}，infer_relation_accuracy={proj_body.infer_relation_accuracy:.4f}")
+    
+async def run_batch_project(project_id: int, body: BatchInferBody):
+    # 后台任务入口
+    # 1) 读取 CSV 缓存，命中的直接使用
+    requested_ids = [str(it.dataset_id) for it in body.datasets]
+    existing_map = _load_existing_update_rows(project_id, requested_ids)
 
-    # 返回项目级结果 + 每条样本简要
+    # 2) 找出未命中的，按需同步推理
+    pending_items = [it for it in body.datasets if str(it.dataset_id) not in existing_map]
+    ran_count = 0
+    if pending_items:
+        filtered_body = BatchInferBody(project_id=body.project_id, datasets=pending_items)
+        await run_batch_infer_project(project_id, filtered_body)
+        ran_count = len(pending_items)
+        # 推理结束后，重新加载完整结果
+        existing_map = _load_existing_update_rows(project_id, requested_ids)
+
+    # 3) 组装返回，顺序与请求一致
+    items = []
+    missing_after_run = []
+    for dsid in requested_ids:
+        b = existing_map.get(dsid)
+        if b is None:
+            missing_after_run.append(dsid)
+            continue
+        items.append({"dataset_id": dsid, **b.dict()})
+
+     # 1) 读取 CSV 缓存，命中的直接使用
+    requested_ids = [str(it.dataset_id) for it in body.datasets]
+    existing_map = _load_existing_update_rows(project_id, requested_ids)
+
+    # 2) 找出未命中的，按需同步推理
+    pending_items = [it for it in body.datasets if str(it.dataset_id) not in existing_map]
+    ran_count = 0
+    if pending_items:
+        filtered_body = BatchInferBody(project_id=body.project_id, datasets=pending_items)
+        await run_batch_infer_project(project_id, filtered_body)
+        ran_count = len(pending_items)
+        # 推理结束后，重新加载完整结果
+        existing_map = _load_existing_update_rows(project_id, requested_ids)
+
+    # 3) 组装返回，顺序与请求一致
+    items = []
+    missing_after_run = []
+    for dsid in requested_ids:
+        b = existing_map.get(dsid)
+        if b is None:
+            missing_after_run.append(dsid)
+            continue
+        items.append({"dataset_id": dsid, **b.dict()})
+
+    # 若仍有缺失，说明推理或持久化失败，提示客户端
+    if missing_after_run:
+        return {
+            "code": 207,
+            "message": "部分样本处理失败，请检查错误日志或稍后重试。",
+            "items": items,
+            "missing_dataset_ids": missing_after_run,
+            "stats": {
+                "requested": len(requested_ids),
+                "from_cache": len(items) - ran_count if (len(items) - ran_count) >= 0 else 0,
+                "ran": ran_count,
+                "returned": len(items)
+            }
+        }
     return {
         "code": 200,
-        "message": "批量分析完成，结果已写入项目与样本CSV。",
-        "project_summary": proj_row,
-        "items": per_item_results,
-        "errors": errors,
-        "stats": {  # 新增简单统计，便于脚本端判断
-            "total": len(body.datasets),
-            "success": len(per_item_results),
-            "failed": len(errors)
-        },
-        "project_callback_response": callback_resp_json
+        "message": "批量分析完成，已返回全部样本结果。",
+        "items": items,
+        "stats": {
+            "requested": len(requested_ids),
+            "from_cache": len(items) - ran_count if (len(items) - ran_count) >= 0 else 0,
+            "ran": ran_count,
+            "returned": len(items)
+        }
+    }
+
+
+@app.post(
+    "/v1/consistency/batch_analyze",
+    summary="[算法执行] 批量分析项目数据并写入项目级汇总/样本结果"
+)
+async def batch_infer_project(project_id: int, body: BatchInferBody):
+    if body.project_id is not None and int(body.project_id) != int(project_id):
+        raise HTTPException(status_code=400, detail="路径中的 project_id 与 body 不一致。")
+    # 启动后台任务  
+    asyncio.create_task(run_batch_project(project_id, body))
+
+    return {
+        "code": 200,
+        "message": "批量分析已启动，请稍后查询结果。",
     }
 
 
@@ -953,4 +1068,4 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
 
 if __name__ == "__main__":
     # 确保启动的是本文件的多卡应用
-    uvicorn.run("chat_tools_intern_multigpu:app", host="0.0.0.0", port=8002, reload=True)
+    uvicorn.run("chat_tools_intern_multigpu:app", host="0.0.0.0", port=8102, reload=True)
