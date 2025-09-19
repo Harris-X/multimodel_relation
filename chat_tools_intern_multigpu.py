@@ -563,7 +563,7 @@ def _load_existing_update_rows(project_id: int, dataset_ids: list[str]) -> dict[
 
 @app.put(
     "/v1/consistency/infer/{project_id}/{dataset_id}",
-    summary="[回调接收] 更新单条数据数据集"
+    summary="[回调接收] 模拟更新单条数据数据集"
 )
 async def update_single_dataset(project_id: int, dataset_id: int, body: UpdateDatasetBody):
     """
@@ -603,7 +603,7 @@ async def get_single_dataset(project_id: int, dataset_id: int):
 
 @app.put(
     "/v1/consistency/infer/{project_id}",
-    summary="[回调接收] 更新项目级聚合结果"
+    summary="[回调接收] 模拟更新项目级聚合结果"
 )
 async def update_project_summary(project_id: int, body: UpdateProjectBody):
     """
