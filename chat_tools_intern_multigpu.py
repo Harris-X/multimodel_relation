@@ -1009,7 +1009,7 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
 
         label = b.actual_relation if b else None
         pred = b.final_relation if b else None
-        consistency_result = b.consistency_result if b else None
+        consistency_result = b.consistency_result.strip() if b else None
         # 计算准确率
         if label in _VALID_REL and pred in _VALID_REL:
             cls_total[label] += 1
