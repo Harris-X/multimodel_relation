@@ -1043,10 +1043,19 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
 
     # 新增：通过 HTTP PUT 回调项目级接口
     callback_url = f"{base_url}/v1/consistency/infer/{project_id}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.put(callback_url, json=proj_body.dict())
-        resp.raise_for_status()
-        callback_resp_json = resp.json()
+    try:
+        async with httpx.AsyncClient() as client:
+            print(f"正在向 {callback_url} 发送回调...")
+            response = await client.put(callback_url, json=proj_body.dict())
+            response.raise_for_status()
+            callback_resp_json = response.json()
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"回调失败: 无法连接到更新接口 at {e.request.url!r}.")
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"回调接口返回错误: {e.response.status_code} - {e.response.text}"
+            )
 
 
     # 若仍有缺失，说明推理或持久化失败，提示客户端
