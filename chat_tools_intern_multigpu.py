@@ -1045,7 +1045,7 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
     callback_url = f"{base_url}/v1/consistency/infer/{project_id}"
     try:
         async with httpx.AsyncClient() as client:
-            print(f"正在向 {callback_url} 发送回调...")
+            print(f"[Project] 正在向 {callback_url} 发送回调...")
             response = await client.put(callback_url, json=proj_body.dict())
             response.raise_for_status()
             callback_resp_json = response.json()
