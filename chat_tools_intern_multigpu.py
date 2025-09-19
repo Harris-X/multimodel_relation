@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 # ==============================================================================
 # 1. 服务与模型配置
 # ==============================================================================
-
+base_url = "http://10.13.31.103:7000/"
 # 从环境变量读取配置（不要在代码里强行覆盖 CUDA_VISIBLE_DEVICES）
 # 可在启动前导出:  export CUDA_VISIBLE_DEVICES=0,1,2
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # <- 删除这类硬编码
@@ -175,7 +175,8 @@ class UpdateDatasetBody(BaseModel):
     rgb_infrared_relation: str # rgb 和红外的关系
     text_infrared_relation: str # 文本 和红外的关系
     rgb_text_relation: str # rgb 和文本的关系
-    final_relation: str # 最终关系
+    final_relation: str # 最终关系 # 缺乏一个labal
+    actual_relation: str  # 新增：标准答案标签
     accuracy: float # 检测准确率 1/0 比对 label 标签
     consistency_result: str # 一致性认知结果, 手动创建
     consistency_result_accuracy: float # 一致性认知结果准确率, 手动创建
@@ -540,22 +541,15 @@ def _load_existing_update_rows(project_id: int, dataset_ids: list[str]) -> dict[
                     if dsid not in wanted:
                         continue
                     # 构建 UpdateDatasetBody
-                    try:
-                        acc = float(row.get("accuracy", 0) or 0)
-                    except Exception:
-                        acc = 0.0
-                    try:
-                        cra = float(row.get("consistency_result_accuracy", 0) or 0)
-                    except Exception:
-                        cra = 0.0
                     body = UpdateDatasetBody(
                         rgb_infrared_relation=row.get("rgb_infrared_relation", "未知"),
                         text_infrared_relation=row.get("text_infrared_relation", "未知"),
                         rgb_text_relation=row.get("rgb_text_relation", "未知"),
                         final_relation=row.get("final_relation", "未知"),
-                        accuracy=acc,
+                        actual_relation=row.get("actual_relation", "未知"),
+                        accuracy=row.get("accuracy", 0),
                         consistency_result=row.get("consistency_result", "None"),
-                        consistency_result_accuracy=cra,
+                        consistency_result_accuracy=row.get("consistency_result_accuracy", 0),
                         raw_model_output=row.get("raw_model_output")
                     )
                     result[dsid] = body
@@ -781,6 +775,7 @@ async def analyze_consistency(
                 text_infrared_relation=rels.get(text_ir_key, "未知"),
                 rgb_text_relation=rels.get(rgb_text_key, "未知"),
                 final_relation=rels.get(final_key, "未知"),
+                actual_relation=label or "未知",  # 新增：标准答案标签
                 accuracy=accuracy,
                 consistency_result=consistency_result_value or "None",
                 consistency_result_accuracy=consistency_result_accuracy,
@@ -791,7 +786,7 @@ async def analyze_consistency(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"模型推理或结果解析失败: {e}")
 
-    callback_url = f"http://10.13.31.103:7000/v1/consistency/infer/{project_id}/{dataset_id}"
+    callback_url = f"{base_url}/v1/consistency/infer/{project_id}/{dataset_id}"
     try:
         async with httpx.AsyncClient() as client:
             print(f"正在向 {callback_url} 发送回调...")
@@ -821,9 +816,7 @@ async def analyze_consistency(
 
 
 async def run_batch_infer_project(project_id: int, body: BatchInferBody):
-    print(f"[BATCH] 后台任务启动 project_id={project_id}, 样本数={len(body.datasets)}")
-    cls_total = {c: 0 for c in _VALID_REL}
-    cls_correct = {c: 0 for c in _VALID_REL}
+    print(f"[BATCH] 批量样本推理启动 project_id={project_id}, 样本数={len(body.datasets)}")
     per_item_results, errors = [], []
 
     async with httpx.AsyncClient(timeout=300.0) as client:  # 拉长总超时
@@ -884,13 +877,8 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
                     # 与 analyze_consistency 一致：提取“综合事实推断”文本作为一致性结果
                     overall_inference = extract_overall_inference(model_output)
 
-                    # 计算准确率
-                    sample_acc = 0.0
-                    if label in _VALID_REL and pred in _VALID_REL:
-                        cls_total[label] += 1
-                        if pred == label:
-                            cls_correct[label] += 1
-                            sample_acc = 1.0
+                    # 计算准确率（基于 label 与预测）
+                    sample_acc = 1.0 if (label in _VALID_REL and pred in _VALID_REL and pred == label) else 0.0
 
                     if consistency_result_label == overall_inference:
                         consistency_result_accuracy=1.0
@@ -903,6 +891,7 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
                         text_infrared_relation=rels.get(tuple(sorted(['文本1', '图片2'])), "未知"),
                         rgb_text_relation=rels.get(tuple(sorted(['图片1', '文本1'])), "未知"),
                         final_relation=pred or (pred_raw or "未知"),
+                        actual_relation=label or (label_raw or "未知"),  # 新增：标准答案标签
                         accuracy=sample_acc,
                         consistency_result=overall_inference or "None",
                         consistency_result_accuracy=consistency_result_accuracy,
@@ -914,11 +903,16 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
                     new_row = {"project_id": project_id, "dataset_id": dsid, **u}
                     await run_in_threadpool(_update_or_append_csv, DATASET_RESULTS_FILE, header, new_row, ["project_id", "dataset_id"])
 
-                    per_item_results.append({"dataset_id": dsid, "label": label or label_raw, "pred": pred or pred_raw or "未知", "accuracy": sample_acc})
+                    per_item_results.append({
+                        "dataset_id": dsid,
+                        "update": update_row.dict(),
+                        "label": label or label_raw,
+                        "pred": pred or pred_raw or "未知",
+                        "accuracy": sample_acc
+                    })
                     print(f"[BATCH] 完成推理 dataset_id={dsid}，写入CSV")
 
-                    base = "http://10.13.31.103:7000"
-                    callback_url = f"{base}/v1/consistency/infer/{project_id}/{dsid}"
+                    callback_url = f"{base_url}/v1/consistency/infer/{project_id}/{dsid}"
                     try:
                         # 复用外层 client，避免覆盖导致已关闭的 client 被使用
                         print(f"正在向 {callback_url} 发送回调...")
@@ -932,6 +926,8 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
                             status_code=502,
                             detail=f"回调接口返回错误: {e.response.status_code} - {e.response.text}"
                         )
+
+                    # 不在此处回调，由上层 run_batch_project 统一回调
                 except Exception as e:
                     # 打印完整错误到控制台
                     import traceback
@@ -939,14 +935,96 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
                     print(f"[BATCH][ERROR] dataset_id={dsid} -> {err}\n{traceback.format_exc()}")
                     errors.append({"dataset_id": dsid, "error": err})
                     continue
+    # 返回每条样本的结果（用于上层处理回调与统计）
+    return per_item_results
+    
+async def run_batch_project(project_id: int, body: BatchInferBody):
+    
+    # 后台任务入口
+    cls_total = {c: 0 for c in _VALID_REL}
+    cls_correct = {c: 0 for c in _VALID_REL}
+    consistency_cognition_accuracy = 0.0  # 预设为0.0，后续可根据需求调整
+    per_item_results, errors = [], []
+
+    # 1) 读取 CSV 缓存，命中的直接使用
+    requested_ids = [str(it.dataset_id) for it in body.datasets]
+    existing_map = _load_existing_update_rows(project_id, requested_ids)
+    for key, update_data in existing_map.items():
+        dataset_id = int(key)
+        print(f"[BATCH] 已缓存 dataset_id={key}")
+        callback_url = f"{base_url}/v1/consistency/infer/{project_id}/{dataset_id}"
+        try:
+            async with httpx.AsyncClient() as client:
+                print(f"正在向 {callback_url} 发送回调...")
+                response = await client.put(callback_url, json=update_data.dict())
+                response.raise_for_status()
+                callback_resp_json = response.json()
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"回调失败: 无法连接到更新接口 at {e.request.url!r}.")
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"回调接口返回错误: {e.response.status_code} - {e.response.text}"
+            )
+    # 2) 找出未命中的，按需同步推理
+    pending_items = [it for it in body.datasets if str(it.dataset_id) not in existing_map]
+    ran_count = 0
+    if pending_items:
+        filtered_body = BatchInferBody(project_id=body.project_id, datasets=pending_items)
+        per_item_results = await run_batch_infer_project(project_id, filtered_body)
+        ran_count = len(per_item_results)
+        # 推理结束后，重新加载完整结果
+        existing_map = _load_existing_update_rows(project_id, requested_ids)
+
+    # 3) 组装返回，顺序与请求一致
+    items = []
+    missing_after_run = []
+    for dsid in requested_ids:
+        b = existing_map.get(dsid)
+        if b is None:
+            missing_after_run.append(dsid)
+            continue
+        items.append({"dataset_id": dsid, **b.dict()})
+    
+    for item in body.datasets:
+        dsid = str(item.dataset_id)
+        b = existing_map.get(dsid)
+
+        # 文本 JSON
+        if is_http_url(item.text_url):
+            t = await client.get(item.text_url); t.raise_for_status()
+            try:
+                j = t.json()
+            except Exception:
+                j = {"text": t.text}
+        else:
+            if not os.path.exists(item.text_url):
+                raise HTTPException(status_code=400, detail=f"{dsid}: 文本JSON路径不存在: {item.text_url}")
+            with open(item.text_url, "r", encoding="utf-8") as jf:
+                j = json.load(jf)
+
+
+        consistency_result_label = (j.get("consistency_result") or "").strip()
+
+        label = b.actual_relation if b else None
+        pred = b.final_relation if b else None
+        consistency_result = b.consistency_result if b else None
+        # 计算准确率
+        if label in _VALID_REL and pred in _VALID_REL:
+            cls_total[label] += 1
+            if pred == label:
+                cls_correct[label] += 1
+        if consistency_result_label == consistency_result:
+            consistency_cognition_accuracy += 1
+
+
 
     # 统计项目级
     per_class_acc = {c: (cls_correct[c] / cls_total[c]) if cls_total[c] > 0 else None for c in _VALID_REL}
     valid_accs = [v for v in per_class_acc.values() if v is not None]
     infer_relation_accuracy = sum(valid_accs) / len(valid_accs) if valid_accs else 0.0
+    consistency_cognition_accuracy = consistency_cognition_accuracy / len(body.datasets) if body.datasets else 0.0
 
-    # 一致性认知准确率：按你的要求先置为 1
-    consistency_cognition_accuracy = 1.0
 
     # 写入项目级 CSV
     proj_body = UpdateProjectBody(
@@ -962,62 +1040,12 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
     proj_row = {"project_id": project_id, **proj_body.dict()}
 
     # 新增：通过 HTTP PUT 回调项目级接口
-    callback_url = f"http://10.13.31.103:7000/v1/consistency/infer/{project_id}"
+    callback_url = f"{base_url}/v1/consistency/infer/{project_id}"
     async with httpx.AsyncClient() as client:
         resp = await client.put(callback_url, json=proj_body.dict())
         resp.raise_for_status()
         callback_resp_json = resp.json()
-    print(f"[BATCH] 项目级回调完成 project_id={project_id}，infer_relation_accuracy={proj_body.infer_relation_accuracy:.4f}")
-    
-async def run_batch_project(project_id: int, body: BatchInferBody):
-    # 后台任务入口
-    # 1) 读取 CSV 缓存，命中的直接使用
-    requested_ids = [str(it.dataset_id) for it in body.datasets]
-    existing_map = _load_existing_update_rows(project_id, requested_ids)
 
-    # 2) 找出未命中的，按需同步推理
-    pending_items = [it for it in body.datasets if str(it.dataset_id) not in existing_map]
-    ran_count = 0
-    if pending_items:
-        filtered_body = BatchInferBody(project_id=body.project_id, datasets=pending_items)
-        await run_batch_infer_project(project_id, filtered_body)
-        ran_count = len(pending_items)
-        # 推理结束后，重新加载完整结果
-        existing_map = _load_existing_update_rows(project_id, requested_ids)
-
-    # 3) 组装返回，顺序与请求一致
-    items = []
-    missing_after_run = []
-    for dsid in requested_ids:
-        b = existing_map.get(dsid)
-        if b is None:
-            missing_after_run.append(dsid)
-            continue
-        items.append({"dataset_id": dsid, **b.dict()})
-
-     # 1) 读取 CSV 缓存，命中的直接使用
-    requested_ids = [str(it.dataset_id) for it in body.datasets]
-    existing_map = _load_existing_update_rows(project_id, requested_ids)
-
-    # 2) 找出未命中的，按需同步推理
-    pending_items = [it for it in body.datasets if str(it.dataset_id) not in existing_map]
-    ran_count = 0
-    if pending_items:
-        filtered_body = BatchInferBody(project_id=body.project_id, datasets=pending_items)
-        await run_batch_infer_project(project_id, filtered_body)
-        ran_count = len(pending_items)
-        # 推理结束后，重新加载完整结果
-        existing_map = _load_existing_update_rows(project_id, requested_ids)
-
-    # 3) 组装返回，顺序与请求一致
-    items = []
-    missing_after_run = []
-    for dsid in requested_ids:
-        b = existing_map.get(dsid)
-        if b is None:
-            missing_after_run.append(dsid)
-            continue
-        items.append({"dataset_id": dsid, **b.dict()})
 
     # 若仍有缺失，说明推理或持久化失败，提示客户端
     if missing_after_run:
