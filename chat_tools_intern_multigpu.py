@@ -24,12 +24,12 @@ from urllib.parse import urlparse
 # ==============================================================================
 # 1. 服务与模型配置
 # ==============================================================================
-base_url = "http://10.13.31.103:7000"
+base_url = "http://localhost:8102"
 # 从环境变量读取配置（不要在代码里强行覆盖 CUDA_VISIBLE_DEVICES）
 # 可在启动前导出:  export CUDA_VISIBLE_DEVICES=0,1,2
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # <- 删除这类硬编码
+# os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # <- 删除这类硬编码
 # 修改模型路径
-MODEL_PATH = r"/home/user/xieqiuhao/multimodel_relation/downloaded_model/InternVL3_5-14B"
+MODEL_PATH = r"/root/autodl-tmp/multimodel_relation/downloaded_model/InternVL3_5-14B"
 # 全局变量,用于在服务启动时加载并持有模型
 model_globals = {
     "tokenizer": None,
@@ -278,7 +278,6 @@ prompt = ("""
 图像1-图像2关系:[关系类型]
 图像1-文本1关系:[关系类型]
 图像2-文本1关系:[关系类型]
-
 图像1-图像2-文本1总体关系:矛盾
 综合事实推断:[描述最相关联的两者给出的事实]
 最相关联的两者是:[图像1和图像2 / 图像1和文本1 / 图像2和文本1]
