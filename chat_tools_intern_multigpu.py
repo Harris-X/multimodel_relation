@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import torch
 from transformers import AutoTokenizer, AutoModel
 from PIL import Image
@@ -192,10 +193,11 @@ class UpdateProjectBody(BaseModel):
     status: ProjectStatusEnum
     infer_relation_accuracy: float # 总体推演关系准确率
     consistency_cognition_accuracy: float # 一致性认知准确率
-    equivalence_relationship_accuracy: float # 等价关系准确率
-    conflict_relationship_accuracy: float # 矛盾关系准确率
-    causation_relationship_accuracy: float # 因果关系准确率
-    relation_accuracy: float # 关联关系准确率
+    # 当某一类在样本中未出现时，其精度为 None（不可用）
+    equivalence_relationship_accuracy: Optional[float] # 等价关系准确率
+    conflict_relationship_accuracy: Optional[float] # 矛盾关系准确率
+    causation_relationship_accuracy: Optional[float] # 因果关系准确率
+    relation_accuracy: Optional[float] # 关联关系准确率
 
 # ---------------- 新增：批量请求体定义 ----------------
 class DatasetItem(BaseModel):
@@ -304,12 +306,14 @@ You are an AI assistant that rigorously follows this response protocol:
 Ensure that the thinking process is thorough but remains focused on the query. The final answer should be standalone and not reference the thinking section.
 """.strip()
 
-def build_initial_messages(instruction_prompt: str, user_text: str | None):
+def build_initial_messages(instruction_prompt: str, user_text: str | None, extra_content: str | None = None):
     # 与 README 保持一致：使用 Image-1/2 标注
     content = f"Image-1: <image>\nImage-2: <image>\n"
     if user_text:
-        content += f"Text-1: {user_text}\n\n"
-    content += instruction_prompt
+        content += f"Text-1: {user_text}\n"
+    if extra_content:
+        content += f"User-Content: {extra_content}\n"
+    content += "\n" + instruction_prompt
     return content
 
 def _first_cuda_device_from_hf_map(model) -> torch.device:
@@ -324,7 +328,14 @@ def _first_cuda_device_from_hf_map(model) -> torch.device:
     # 回退
     return torch.device("cuda:0")
 
-def chat(image1_path: str, image2_path: str, text: str):
+def chat(
+    image1_path: str,
+    image2_path: str,
+    text: str,
+    extra_content: str | None = None,
+    history=None,
+    return_history: bool = False,
+):
     tokenizer = model_globals["tokenizer"]
     model = model_globals["model"]
     in_dtype = model_globals.get("dtype", torch.bfloat16)
@@ -343,7 +354,7 @@ def chat(image1_path: str, image2_path: str, text: str):
             # 把输入直接放到模型首块 GPU，避免先到 cuda:0 再搬运
             pixel_values = pixel_values.to(dev0, non_blocking=True)
 
-        question = build_initial_messages(prompt, text)
+        question = build_initial_messages(prompt, text, extra_content=extra_content)
         generation_config = dict(
             max_new_tokens=512,   # 适度调低生成长度可明显降显存峰值
             do_sample=False,
@@ -358,15 +369,17 @@ def chat(image1_path: str, image2_path: str, text: str):
                 question=question,
                 generation_config=generation_config,
                 num_patches_list=num_patches_list,
-                history=None,
-                return_history=False   # 关闭历史返回，减少内存保留
+                history=history,
+                return_history=return_history   # 是否返回历史，由调用方控制
             )
         # 兼容返回签名：可能是 str 或 (str, history)
         if isinstance(chat_ret, tuple):
             response = chat_ret[0]
+            new_history = chat_ret[1] if len(chat_ret) > 1 else None
         else:
             response = chat_ret
-        return response
+            new_history = None
+        return (response, new_history) if return_history else response
     finally:
         try:
             del pixel_values1, pixel_values2
@@ -456,6 +469,32 @@ DATASET_RESULTS_FILE = "dataset_results.csv"
 PROJECT_RESULTS_FILE = "project_results.csv"
 # 文件操作锁
 file_lock = RLock()
+
+# --- 会话持久化（服务端存储上一轮的图像/文本与对话历史） ---
+SESSIONS_DIR = "session_cache"
+session_lock = RLock()
+
+def _session_key(project_id: int, dataset_id: int) -> str:
+    return f"{project_id}_{dataset_id}"
+
+def _session_dir(project_id: int, dataset_id: int) -> str:
+    return os.path.join(SESSIONS_DIR, _session_key(project_id, dataset_id))
+
+def _ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def _save_json(path: str, obj: dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def _load_json(path: str) -> Optional[dict]:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 def _serialize_for_csv(value: Optional[str]) -> str:
     """
@@ -672,120 +711,213 @@ async def analyze_consistency(
     rgb_image: Optional[UploadFile] = None,
     infrared_image: Optional[UploadFile] = None,
     text: Optional[str] = Form(None),
+    # 新增：额外用户内容（例如附加提示）与历史对话
+    content: Optional[str] = Form(None),
+    history_json: Optional[str] = Form(None),
 ):
-    with tempfile.TemporaryDirectory() as temp_dir:
+    # 状态化：优先从 session_cache 读取已缓存的图像、文本与历史；若本次提供了新的输入，则更新缓存
+    sess_dir = _session_dir(project_id, dataset_id)
+    _ensure_dir(SESSIONS_DIR)
+    cached = None
+    with session_lock:
+        cached = _load_json(os.path.join(sess_dir, "meta.json"))
+
+    # 从缓存恢复或接收新输入
+    need_download_or_upload = any([rgb_image_url, infrared_image_url, text_json_url, rgb_image is not None, infrared_image is not None, text is not None])
+
+    # 将历史合并：优先使用传入的 history_json，否则使用缓存中的 history
+    incoming_history = None
+    if history_json:
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                # RGB
-                if rgb_image_url:
-                    if is_http_url(rgb_image_url):
-                        resp = await client.get(rgb_image_url); resp.raise_for_status()
-                        rgb_path = os.path.join(temp_dir, f"{uuid.uuid4()}_rgb.jpg")
-                        with open(rgb_path, "wb") as f: f.write(resp.content)
-                    else:
-                        if not os.path.exists(rgb_image_url):
-                            raise HTTPException(status_code=400, detail=f"RGB图像路径不存在: {rgb_image_url}")
-                        rgb_path = rgb_image_url
-                elif rgb_image is not None:
-                    rgb_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{rgb_image.filename}")
-                    with open(rgb_path, "wb") as f: f.write(await rgb_image.read())
-                else:
-                    raise HTTPException(status_code=400, detail="缺少 RGB 图像：请提供 rgb_image_url 或上传 rgb_image 文件")
-
-                # IR
-                if infrared_image_url:
-                    if is_http_url(infrared_image_url):
-                        resp = await client.get(infrared_image_url); resp.raise_for_status()
-                        ir_path = os.path.join(temp_dir, f"{uuid.uuid4()}_ir.jpg")
-                        with open(ir_path, "wb") as f: f.write(resp.content)
-                    else:
-                        if not os.path.exists(infrared_image_url):
-                            raise HTTPException(status_code=400, detail=f"红外图像路径不存在: {infrared_image_url}")
-                        ir_path = infrared_image_url
-                elif infrared_image is not None:
-                    ir_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{infrared_image.filename}")
-                    with open(ir_path, "wb") as f: f.write(await infrared_image.read())
-                else:
-                    raise HTTPException(status_code=400, detail="缺少红外图像：请提供 infrared_image_url 或上传 infrared_image 文件")
-
-                # 文本
-                if text_json_url:
-                    if is_http_url(text_json_url):
-                        t_resp = await client.get(text_json_url); t_resp.raise_for_status()
-                        try:
-                            j = t_resp.json()
-                        except Exception:
-                            j = {"text": t_resp.text}
-                    else:
-                        if not os.path.exists(text_json_url):
-                            raise HTTPException(status_code=400, detail=f"文本JSON路径不存在: {text_json_url}")
-                        with open(text_json_url, "r", encoding="utf-8") as jf:
-                            j = json.load(jf)
-                    final_text = (j.get("text") or "").strip()
-                    consistency_result_label = (j.get("label") or "").strip()
-                    label_raw = (j.get("label") or "").strip()
-                    label = normalize_relation_name(label_raw)
-                    if not final_text:
-                        raise HTTPException(status_code=400, detail=f"文本JSON中未找到有效的 'text' 字段")
-                elif text is not None:
-                    final_text = text
-                else:
-                    raise HTTPException(status_code=400, detail="缺少文本：请提供 text_json_url 或 text 原文")
-        except HTTPException:
-            raise
+            incoming_history = json.loads(history_json)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"输入处理失败: {e}")
+            raise HTTPException(status_code=400, detail=f"history_json 解析失败: {e}")
 
-        try:
-            # 在线程池中运行耗时的模型推理
-            print(f"开始为 project:{project_id} dataset:{dataset_id} 进行模型推理...")
-            model_response = await run_in_threadpool(chat, rgb_path, ir_path, final_text)
-            # print(f"模型推理完成。原始输出: \n{model_response}")
+    # 确定图像与文本路径/内容
+    rgb_path = None
+    ir_path = None
+    final_text = None
+    consistency_result_label = None
+    label = None
 
-            # 解析模型输出
-            parsed_result = check_label_re(model_response)
-            overall_inference = extract_overall_inference(model_response)
+    # 如果提供了新的输入，则解析并写入缓存；否则从缓存读取（若不存在则报错）
+    if need_download_or_upload:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    # RGB
+                    if rgb_image_url:
+                        if is_http_url(rgb_image_url):
+                            resp = await client.get(rgb_image_url); resp.raise_for_status()
+                            tmp_rgb = os.path.join(temp_dir, f"{uuid.uuid4()}_rgb.jpg")
+                            with open(tmp_rgb, "wb") as f: f.write(resp.content)
+                        else:
+                            if not os.path.exists(rgb_image_url):
+                                raise HTTPException(status_code=400, detail=f"RGB图像路径不存在: {rgb_image_url}")
+                            tmp_rgb = rgb_image_url
+                    elif rgb_image is not None:
+                        tmp_rgb = os.path.join(temp_dir, f"{uuid.uuid4()}_{rgb_image.filename}")
+                        with open(tmp_rgb, "wb") as f: f.write(await rgb_image.read())
+                    else:
+                        tmp_rgb = None
 
-            rels = {
-                tuple(sorted(r["entities"])): r["type"]
-                for r in parsed_result.get("relationships", [])
-            }
+                    # IR
+                    if infrared_image_url:
+                        if is_http_url(infrared_image_url):
+                            resp = await client.get(infrared_image_url); resp.raise_for_status()
+                            tmp_ir = os.path.join(temp_dir, f"{uuid.uuid4()}_ir.jpg")
+                            with open(tmp_ir, "wb") as f: f.write(resp.content)
+                        else:
+                            if not os.path.exists(infrared_image_url):
+                                raise HTTPException(status_code=400, detail=f"红外图像路径不存在: {infrared_image_url}")
+                            tmp_ir = infrared_image_url
+                    elif infrared_image is not None:
+                        tmp_ir = os.path.join(temp_dir, f"{uuid.uuid4()}_{infrared_image.filename}")
+                        with open(tmp_ir, "wb") as f: f.write(await infrared_image.read())
+                    else:
+                        tmp_ir = None
 
-            rgb_ir_key = tuple(sorted(['图片1', '图片2']))
-            text_ir_key = tuple(sorted(['文本1', '图片2']))
-            rgb_text_key = tuple(sorted(['图片1', '文本1']))
-            final_key = tuple(sorted(['图片1', '图片2', '文本1']))
-            pred_raw = rels.get(final_key)
-            pred = normalize_relation_name(pred_raw)
+                    # 文本
+                    loaded_json = None
+                    if text_json_url:
+                        if is_http_url(text_json_url):
+                            t_resp = await client.get(text_json_url); t_resp.raise_for_status()
+                            try:
+                                loaded_json = t_resp.json()
+                            except Exception:
+                                loaded_json = {"text": t_resp.text}
+                        else:
+                            if not os.path.exists(text_json_url):
+                                raise HTTPException(status_code=400, detail=f"文本JSON路径不存在: {text_json_url}")
+                            with open(text_json_url, "r", encoding="utf-8") as jf:
+                                loaded_json = json.load(jf)
+                        final_text = (loaded_json.get("text") or "").strip()
+                        consistency_result_label = (loaded_json.get("consistency_result") or "").strip()
+                        label_raw = (loaded_json.get("label") or "").strip()
+                        label = normalize_relation_name(label_raw)
+                        if not final_text:
+                            raise HTTPException(status_code=400, detail=f"文本JSON中未找到有效的 'text' 字段")
+                    elif text is not None:
+                        final_text = text
 
-            consistency_result_value = overall_inference
-            if consistency_result_label == overall_inference:
-                consistency_result_accuracy=1.0
-            else:
-                consistency_result_accuracy=0.0
+                # 将新输入保存到 session_cache（若提供了）
+                with session_lock:
+                    _ensure_dir(sess_dir)
+                    # 保存图像
+                    if tmp_rgb:
+                        dst_rgb = os.path.join(sess_dir, "rgb.jpg")
+                        if os.path.abspath(tmp_rgb) != os.path.abspath(dst_rgb):
+                            shutil.copyfile(tmp_rgb, dst_rgb)
+                        rgb_path = dst_rgb
+                    elif cached and os.path.exists(os.path.join(sess_dir, "rgb.jpg")):
+                        rgb_path = os.path.join(sess_dir, "rgb.jpg")
 
-            if pred ==  label and label is not None:
-                accuracy = 1.0
-            else:
-                accuracy = 0.0
+                    if tmp_ir:
+                        dst_ir = os.path.join(sess_dir, "ir.jpg")
+                        if os.path.abspath(tmp_ir) != os.path.abspath(dst_ir):
+                            shutil.copyfile(tmp_ir, dst_ir)
+                        ir_path = dst_ir
+                    elif cached and os.path.exists(os.path.join(sess_dir, "ir.jpg")):
+                        ir_path = os.path.join(sess_dir, "ir.jpg")
 
-            
+                    # 保存文本与标签
+                    meta = _load_json(os.path.join(sess_dir, "meta.json")) or {}
+                    if final_text is not None:
+                        meta["text"] = final_text
+                    if label is not None:
+                        meta["label"] = label
+                    if consistency_result_label is not None:
+                        meta["consistency_result_label"] = consistency_result_label
+                    # 历史：若传入新的 history 则覆盖；否则保留已有
+                    if incoming_history is not None:
+                        meta["history"] = incoming_history
+                    else:
+                        # 如果 meta 还没有历史，则初始化为空
+                        meta.setdefault("history", None)
+                    _save_json(os.path.join(sess_dir, "meta.json"), meta)
 
-            update_data = UpdateDatasetBody(
-                rgb_infrared_relation=rels.get(rgb_ir_key, "未知"),
-                text_infrared_relation=rels.get(text_ir_key, "未知"),
-                rgb_text_relation=rels.get(rgb_text_key, "未知"),
-                final_relation=rels.get(final_key, "未知"),
-                actual_relation=label or "未知",  # 新增：标准答案标签
-                accuracy=accuracy,
-                consistency_result=consistency_result_value or "None",
-                consistency_result_accuracy=consistency_result_accuracy,
-                raw_model_output=model_response  # 新增：持久化模型原始输出
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"模型推理或结果解析失败: {e}")
+                    # 在会话变量中回填
+                    final_text = meta.get("text")
+                    label = meta.get("label")
+                    consistency_result_label = meta.get("consistency_result_label")
+                    history = meta.get("history")
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"输入处理失败: {e}")
+    else:
+        # 未提供新输入：必须存在缓存
+        if not cached:
+            raise HTTPException(status_code=400, detail="未找到会话缓存：请在首轮提供图像与文本后再继续对话。")
+        rgb_path = os.path.join(sess_dir, "rgb.jpg")
+        ir_path = os.path.join(sess_dir, "ir.jpg")
+        if not (os.path.exists(rgb_path) and os.path.exists(ir_path)):
+            raise HTTPException(status_code=400, detail="会话缓存不完整：缺少图像，请重新发起首轮请求。")
+        final_text = cached.get("text")
+        label = cached.get("label")
+        consistency_result_label = cached.get("consistency_result_label")
+        history = incoming_history if incoming_history is not None else cached.get("history")
+        if not isinstance(history, (list, type(None))):
+            history = None
+
+    # 进行模型推理
+    try:
+        print(f"开始为 project:{project_id} dataset:{dataset_id} 进行模型推理...")
+        chat_result = await run_in_threadpool(chat, rgb_path, ir_path, final_text, content, history, True)
+        if isinstance(chat_result, tuple):
+            model_response, new_history = chat_result
+        else:
+            model_response, new_history = chat_result, None
+
+        # 将新的历史写回缓存
+        with session_lock:
+            meta = _load_json(os.path.join(sess_dir, "meta.json")) or {}
+            meta["history"] = new_history
+            _save_json(os.path.join(sess_dir, "meta.json"), meta)
+
+        # 解析模型输出
+        parsed_result = check_label_re(model_response)
+        overall_inference = extract_overall_inference(model_response)
+
+        rels = {
+            tuple(sorted(r["entities"])): r["type"]
+            for r in parsed_result.get("relationships", [])
+        }
+
+        rgb_ir_key = tuple(sorted(['图片1', '图片2']))
+        text_ir_key = tuple(sorted(['文本1', '图片2']))
+        rgb_text_key = tuple(sorted(['图片1', '文本1']))
+        final_key = tuple(sorted(['图片1', '图片2', '文本1']))
+        pred_raw = rels.get(final_key)
+        pred = normalize_relation_name(pred_raw)
+
+        consistency_result_value = overall_inference
+        if consistency_result_label == overall_inference:
+            consistency_result_accuracy = 1.0
+        else:
+            consistency_result_accuracy = 0.0
+
+        if pred == label and label is not None:
+            accuracy = 1.0
+        else:
+            accuracy = 0.0
+
+        update_data = UpdateDatasetBody(
+            rgb_infrared_relation=rels.get(rgb_ir_key, "未知"),
+            text_infrared_relation=rels.get(text_ir_key, "未知"),
+            rgb_text_relation=rels.get(rgb_text_key, "未知"),
+            final_relation=rels.get(final_key, "未知"),
+            actual_relation=label or "未知",  # 新增：标准答案标签
+            accuracy=accuracy,
+            consistency_result=consistency_result_value or "None",
+            consistency_result_accuracy=consistency_result_accuracy,
+            raw_model_output=model_response  # 新增：持久化模型原始输出
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"模型推理或结果解析失败: {e}")
 
     callback_url = f"{base_url}/v1/consistency/infer/{project_id}/{dataset_id}"
     try:
@@ -810,7 +942,9 @@ async def analyze_consistency(
             "overall_inference": overall_inference,
             "callback_data": update_data.dict(),
             "raw_model_output": model_response,
-            "callback_response": callback_resp_json
+            "callback_response": callback_resp_json,
+            "history": new_history,  # 回传新的历史（仅单条接口返回）
+            # 直接回传构造的 question 便于前端调试（可选）
         }
     }
 
@@ -940,7 +1074,7 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
     return per_item_results
     
 async def run_batch_project(project_id: int, body: BatchInferBody):
-    
+    # 注意：批量推理路径不使用会话缓存，避免占用磁盘与显存；单条接口负责多轮对话
     # 后台任务入口
     cls_total = {c: 0 for c in _VALID_REL}
     cls_correct = {c: 0 for c in _VALID_REL}
