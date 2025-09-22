@@ -343,76 +343,100 @@ def chat(
     if not tokenizer or not model:
         raise RuntimeError("模型尚未加载。")
 
-    pixel_values = None
-    try:
-        # 可通过环境变量调优内存占用
-        # 注意：多数 InternVL 配置期望 image_size=448，改动会导致内部形状不匹配
-        img_input_size = int(os.environ.get("IMG_INPUT_SIZE", "448"))  # 默认 448（与模型预设一致）
-        rgb_max_blocks = int(os.environ.get("RGB_MAX_BLOCKS", "8"))     # 默认 8 块
-        ir_max_blocks = int(os.environ.get("IR_MAX_BLOCKS", "6"))       # 默认 6 块
-
-        pixel_values1 = load_image(image1_path, input_size=img_input_size, max_num=rgb_max_blocks)
-        pixel_values2 = load_image(image2_path, input_size=img_input_size, max_num=ir_max_blocks)
-        num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
-        pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
-
-        # 多 GPU 分片时：让 Accelerate/transformers 自行把输入分发到各分片，避免将整批输入集中到单卡
-        if torch.cuda.is_available():
-            hf_map = getattr(model, "hf_device_map", None)
-            if isinstance(hf_map, dict):
-                gpu_set = {str(v) for v in hf_map.values() if (isinstance(v, str) and v.startswith("cuda:")) or isinstance(v, int)}
-                multi_gpu = len(gpu_set) >= 2
-            else:
-                multi_gpu = torch.cuda.device_count() >= 2
-            if not multi_gpu:
-                # 单卡情况下再显式搬运，减少隐式拷贝
-                pixel_values = pixel_values.to(torch.device("cuda:0"), non_blocking=True)
-
-        # 第一轮：构建包含系统说明、图像占位与文本的完整提示；
-        # 后续轮：仅发送用户问题（content），历史中已包含前置要求与图像占位。
-        is_first_turn = not history  # None 或 空列表 均视为首轮
-        if is_first_turn:
-            question = build_initial_messages(prompt, text, extra_content=extra_content)
-        else:
-            question = (extra_content or "请继续").strip()
-        generation_config = dict(
-            max_new_tokens=int(os.environ.get("MAX_NEW_TOKENS", "512")),   # 默认 256，显著降低 KV cache
-            do_sample=False,
-            temperature=0.6,
-            repetition_penalty=1.05
-        )
-
-        with torch.inference_mode():
-            chat_ret = model.chat(
-                tokenizer=tokenizer,
-                pixel_values=pixel_values,
-                question=question,
-                generation_config=generation_config,
-                num_patches_list=num_patches_list,
-                history=history,
-                return_history=return_history   # 是否返回历史，由调用方控制
-            )
-        # 兼容返回签名：可能是 str 或 (str, history)
-        if isinstance(chat_ret, tuple):
-            response = chat_ret[0]
-            new_history = chat_ret[1] if len(chat_ret) > 1 else None
-        else:
-            response = chat_ret
-            new_history = None
-        return (response, new_history) if return_history else response
-    finally:
+    def _run_once(img_size, rgb_blocks, ir_blocks, max_new_tokens):
+        pixel_values = None
+        pixel_values1 = None
+        pixel_values2 = None
         try:
-            del pixel_values1, pixel_values2
-        except Exception:
-            pass
-        if pixel_values is not None:
-            del pixel_values
+            pixel_values1 = load_image(image1_path, input_size=img_size, max_num=rgb_blocks)
+            pixel_values2 = load_image(image2_path, input_size=img_size, max_num=ir_blocks)
+            num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
+            pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
+
+            # 多 GPU 分片时：让 Accelerate/transformers 自行把输入分发到各分片，避免集中到单卡
+            if torch.cuda.is_available():
+                hf_map = getattr(model, "hf_device_map", None)
+                if isinstance(hf_map, dict):
+                    gpu_set = {str(v) for v in hf_map.values() if (isinstance(v, str) and v.startswith("cuda:")) or isinstance(v, int)}
+                    multi_gpu = len(gpu_set) >= 2
+                else:
+                    multi_gpu = torch.cuda.device_count() >= 2
+                if not multi_gpu:
+                    pixel_values = pixel_values.to(torch.device("cuda:0"), non_blocking=True)
+
+            # 问题构造
+            is_first_turn = not history
+            if is_first_turn:
+                question = build_initial_messages(prompt, text, extra_content=extra_content)
+            else:
+                question = (extra_content or "请继续").strip()
+
+            # 生成参数
+            generation_config = dict(
+                max_new_tokens=int(max_new_tokens),
+                do_sample=False,
+                temperature=0.6,
+                repetition_penalty=1.05,
+            )
+
+            with torch.inference_mode():
+                chat_ret = model.chat(
+                    tokenizer=tokenizer,
+                    pixel_values=pixel_values,
+                    question=question,
+                    generation_config=generation_config,
+                    num_patches_list=num_patches_list,
+                    history=history,
+                    return_history=return_history
+                )
+            if isinstance(chat_ret, tuple):
+                response = chat_ret[0]
+                new_history = chat_ret[1] if len(chat_ret) > 1 else None
+            else:
+                response = chat_ret
+                new_history = None
+            return response, new_history
+        finally:
+            try:
+                del pixel_values1, pixel_values2
+            except Exception:
+                pass
+            if pixel_values is not None:
+                del pixel_values
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+
+    # 读取默认参数
+    img_input_size = int(os.environ.get("IMG_INPUT_SIZE", "448"))
+    rgb_max_blocks = int(os.environ.get("RGB_MAX_BLOCKS", "8"))
+    ir_max_blocks = int(os.environ.get("IR_MAX_BLOCKS", "6"))
+    max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "256"))
+
+    # 首次尝试
+    try:
+        resp, new_hist = _run_once(img_input_size, rgb_max_blocks, ir_max_blocks, max_new_tokens)
+        return (resp, new_hist) if return_history else resp
+    except torch.cuda.OutOfMemoryError:
+        # 自适应降档并重试一次
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             try:
                 torch.cuda.ipc_collect()
             except Exception:
                 pass
+        reduced_rgb = max(2, rgb_max_blocks // 2)
+        reduced_ir = max(2, ir_max_blocks // 2)
+        reduced_tokens = max(96, max_new_tokens // 2)
+        try:
+            resp, new_hist = _run_once(img_input_size, reduced_rgb, reduced_ir, reduced_tokens)
+            return (resp, new_hist) if return_history else resp
+        except Exception as e:
+            # 再次失败则抛出，由上层返回 500
+            raise
 
 def extract_first_paragraph_after_answer(s: str) -> str:
     # 思考模式会产生 <think>...</think> 块，答案在后面
