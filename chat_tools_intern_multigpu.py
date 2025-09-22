@@ -346,9 +346,10 @@ def chat(
     pixel_values = None
     try:
         # 可通过环境变量调优内存占用
-        img_input_size = int(os.environ.get("IMG_INPUT_SIZE", "392"))  # 默认 392 降低内存
-        rgb_max_blocks = int(os.environ.get("RGB_MAX_BLOCKS", "8"))     # 默认 6 块
-        ir_max_blocks = int(os.environ.get("IR_MAX_BLOCKS", "6"))       # 默认 4 块
+        # 注意：多数 InternVL 配置期望 image_size=448，改动会导致内部形状不匹配
+        img_input_size = int(os.environ.get("IMG_INPUT_SIZE", "448"))  # 默认 448（与模型预设一致）
+        rgb_max_blocks = int(os.environ.get("RGB_MAX_BLOCKS", "8"))     # 默认 8 块
+        ir_max_blocks = int(os.environ.get("IR_MAX_BLOCKS", "6"))       # 默认 6 块
 
         pixel_values1 = load_image(image1_path, input_size=img_input_size, max_num=rgb_max_blocks)
         pixel_values2 = load_image(image2_path, input_size=img_input_size, max_num=ir_max_blocks)
