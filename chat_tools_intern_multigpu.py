@@ -124,7 +124,7 @@ def load_model():
         dtype = torch.float32
 
     # 多卡配置：device_map 与 max_memory
-    device_map = os.environ.get("HF_DEVICE_MAP", "balanced")  # 强制均衡分片；需要时可改回 auto
+    device_map = os.environ.get("HF_DEVICE_MAP", "balanced")  # 默认均衡分片；可设为 auto / balanced_low_0
     # 每卡可用显存比例，默认 0.9，可通过 GPU_MEM_FRACTION=0.85 覆盖
     mem_fraction = float(os.environ.get("GPU_MEM_FRACTION", "1.0"))
     max_memory = None
@@ -134,7 +134,8 @@ def load_model():
             total = torch.cuda.get_device_properties(i).total_memory // (1024 * 1024)  # MiB
             cap = int(total * mem_fraction)
             max_memory[i] = f"{cap}MiB"
-        print(f"Detected {torch.cuda.device_count()} GPUs, max_memory per GPU: {max_memory}")
+    print(f"Detected {torch.cuda.device_count()} GPUs, max_memory per GPU: {max_memory}")
+    print(f"Using device_map={device_map}, GPU_MEM_FRACTION={mem_fraction}")
 
     # 使用 transformers(集成 accelerate) 的多 GPU 自动分片
     model = AutoModel.from_pretrained(
@@ -344,19 +345,37 @@ def chat(
 
     pixel_values = None
     try:
-        pixel_values1 = load_image(image1_path, max_num=8)   # 可酌情降为 8/6 以减小激活
-        pixel_values2 = load_image(image2_path, max_num=6)
+        # 可通过环境变量调优内存占用
+        img_input_size = int(os.environ.get("IMG_INPUT_SIZE", "392"))  # 默认 392 降低内存
+        rgb_max_blocks = int(os.environ.get("RGB_MAX_BLOCKS", "8"))     # 默认 6 块
+        ir_max_blocks = int(os.environ.get("IR_MAX_BLOCKS", "6"))       # 默认 4 块
+
+        pixel_values1 = load_image(image1_path, input_size=img_input_size, max_num=rgb_max_blocks)
+        pixel_values2 = load_image(image2_path, input_size=img_input_size, max_num=ir_max_blocks)
         num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
         pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
 
+        # 多 GPU 分片时：让 Accelerate/transformers 自行把输入分发到各分片，避免将整批输入集中到单卡
         if torch.cuda.is_available():
-            dev0 = _first_cuda_device_from_hf_map(model)
-            # 把输入直接放到模型首块 GPU，避免先到 cuda:0 再搬运
-            pixel_values = pixel_values.to(dev0, non_blocking=True)
+            hf_map = getattr(model, "hf_device_map", None)
+            if isinstance(hf_map, dict):
+                gpu_set = {str(v) for v in hf_map.values() if (isinstance(v, str) and v.startswith("cuda:")) or isinstance(v, int)}
+                multi_gpu = len(gpu_set) >= 2
+            else:
+                multi_gpu = torch.cuda.device_count() >= 2
+            if not multi_gpu:
+                # 单卡情况下再显式搬运，减少隐式拷贝
+                pixel_values = pixel_values.to(torch.device("cuda:0"), non_blocking=True)
 
-        question = build_initial_messages(prompt, text, extra_content=extra_content)
+        # 第一轮：构建包含系统说明、图像占位与文本的完整提示；
+        # 后续轮：仅发送用户问题（content），历史中已包含前置要求与图像占位。
+        is_first_turn = not history  # None 或 空列表 均视为首轮
+        if is_first_turn:
+            question = build_initial_messages(prompt, text, extra_content=extra_content)
+        else:
+            question = (extra_content or "请继续").strip()
         generation_config = dict(
-            max_new_tokens=512,   # 适度调低生成长度可明显降显存峰值
+            max_new_tokens=int(os.environ.get("MAX_NEW_TOKENS", "512")),   # 默认 256，显著降低 KV cache
             do_sample=False,
             temperature=0.6,
             repetition_penalty=1.05
@@ -389,6 +408,10 @@ def chat(
             del pixel_values
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
 
 def extract_first_paragraph_after_answer(s: str) -> str:
     # 思考模式会产生 <think>...</think> 块，答案在后面
