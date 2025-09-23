@@ -436,8 +436,45 @@ def chat(
         try:
             resp, new_hist = _run_once(img_input_size, reduced_rgb, reduced_ir, reduced_tokens)
             return (resp, new_hist) if return_history else resp
+        except torch.cuda.OutOfMemoryError:
+            # 最终回退：纯文本模式（不再送入图片），依赖历史对话上下文
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+            is_first_turn = not history
+            # 第二轮及以后：只用用户 content；首轮纯文本则补上系统提示
+            if is_first_turn:
+                question = build_initial_messages(prompt, text, extra_content=extra_content)
+            else:
+                question = (extra_content or "请继续").strip()
+            generation_config = dict(
+                max_new_tokens=int(max(64, reduced_tokens // 2)),
+                do_sample=False,
+                temperature=0.6,
+                repetition_penalty=1.05,
+            )
+            with torch.inference_mode():
+                chat_ret = model.chat(
+                    tokenizer=tokenizer,
+                    pixel_values=None,  # 关键：纯文本回退
+                    question=question,
+                    generation_config=generation_config,
+                    num_patches_list=None,
+                    history=history,
+                    return_history=return_history
+                )
+            if isinstance(chat_ret, tuple):
+                response = chat_ret[0]
+                new_history = chat_ret[1] if len(chat_ret) > 1 else None
+            else:
+                response = chat_ret
+                new_history = None
+            return (response, new_history) if return_history else response
         except Exception as e:
-            # 再次失败则抛出，由上层返回 500
+            # 其它错误直接抛出
             raise
 
 
@@ -470,11 +507,10 @@ def stream_chat(
     ir_max_blocks = int(os.environ.get("IR_MAX_BLOCKS", "6"))
     max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "256"))
 
-    # 预处理图像（与 chat 一致）
+    # 预留张量句柄用于清理
     pixel_values = None
     pixel_values1 = None
     pixel_values2 = None
-    num_patches_list = None
 
     def _cleanup():
         try:
@@ -494,88 +530,172 @@ def stream_chat(
                 pass
 
     try:
-        pixel_values1 = load_image(image1_path, input_size=img_input_size, max_num=rgb_max_blocks)
-        pixel_values2 = load_image(image2_path, input_size=img_input_size, max_num=ir_max_blocks)
-        num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
-        pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
+        # 当前尝试的参数（可降档）
+        cur_rgb_blocks = rgb_max_blocks
+        cur_ir_blocks = ir_max_blocks
+        cur_max_new_tokens = max_new_tokens
+        attempt = 0
+        max_attempts = 3  # 原始一次 + 降档一次 + 纯文本一次
+        text_only_fallback_used = False
 
-        # 多 GPU：单卡时放到 cuda:0，多卡让 HF 处理
-        if torch.cuda.is_available():
-            hf_map = getattr(model, "hf_device_map", None)
-            if isinstance(hf_map, dict):
-                gpu_set = {str(v) for v in hf_map.values() if (isinstance(v, str) and v.startswith("cuda:")) or isinstance(v, int)}
-                multi_gpu = len(gpu_set) >= 2
+        while attempt < max_attempts:
+            attempt += 1
+            # 预处理（若非纯文本）
+            if not text_only_fallback_used:
+                yield sse_format({"type": "status", "stage": "preprocess_start"})
+                try:
+                    pixel_values1 = load_image(image1_path, input_size=img_input_size, max_num=cur_rgb_blocks)
+                    pixel_values2 = load_image(image2_path, input_size=img_input_size, max_num=cur_ir_blocks)
+                except Exception as e:
+                    yield sse_format({"type": "error", "message": f"图像预处理失败: {e}"})
+                    return
+                num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
+                pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
+                yield sse_format({"type": "status", "stage": "preprocess_done", "rgb_blocks": int(num_patches_list[0]), "ir_blocks": int(num_patches_list[1])})
+
+                # 多 GPU：单卡时放到 cuda:0，多卡让 HF 处理
+                if torch.cuda.is_available():
+                    hf_map = getattr(model, "hf_device_map", None)
+                    if isinstance(hf_map, dict):
+                        gpu_set = {str(v) for v in hf_map.values() if (isinstance(v, str) and v.startswith("cuda:")) or isinstance(v, int)}
+                        multi_gpu = len(gpu_set) >= 2
+                    else:
+                        multi_gpu = torch.cuda.device_count() >= 2
+                    if not multi_gpu:
+                        pixel_values = pixel_values.to(torch.device("cuda:0"), non_blocking=True)
             else:
-                multi_gpu = torch.cuda.device_count() >= 2
-            if not multi_gpu:
-                pixel_values = pixel_values.to(torch.device("cuda:0"), non_blocking=True)
+                # 纯文本回退路径
+                pixel_values = None
+                num_patches_list = []
+                yield sse_format({"type": "status", "stage": "text_only_fallback"})
 
-        # 问题构造（与 chat 一致）
-        is_first_turn = not history
-        if is_first_turn:
-            question = build_initial_messages(prompt, text, extra_content=extra_content)
-        else:
-            question = (extra_content or "请继续").strip()
+            # 问题构造（与 chat 一致）
+            is_first_turn = not history
+            if is_first_turn:
+                question = build_initial_messages(prompt, text, extra_content=extra_content)
+            else:
+                question = (extra_content or "请继续").strip()
+            yield sse_format({"type": "status", "stage": "question_ready", "first_turn": bool(is_first_turn)})
 
-        # 构造 streamer 并在子线程中运行 model.chat
-        streamer = TextIteratorStreamer(tokenizer=tokenizer, skip_prompt=True, skip_special_tokens=True)
-        generation_config = dict(
-            max_new_tokens=int(max_new_tokens),
-            do_sample=False,
-            temperature=0.6,
-            repetition_penalty=1.05,
-            streamer=streamer,  # 关键：启用流式
-        )
+            # 构造 streamer 与生成配置
+            streamer = TextIteratorStreamer(
+                tokenizer=tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=True,
+                timeout=float(os.environ.get("STREAM_TIMEOUT", "2.0")),
+                poll_interval=0.02,
+            )
+            generation_config = dict(
+                max_new_tokens=int(cur_max_new_tokens),
+                do_sample=False,
+                temperature=0.6,
+                repetition_penalty=1.05,
+                streamer=streamer,
+            )
 
-        result_holder = {"response": "", "history": None, "error": None}
+            result_holder = {"response": "", "history": None, "error": None, "error_type": None}
 
-        def _worker():
-            try:
-                ret = model.chat(
-                    tokenizer=tokenizer,
-                    pixel_values=pixel_values,
-                    question=question,
-                    generation_config=generation_config,
-                    num_patches_list=num_patches_list,
-                    history=history,
-                    return_history=True,
-                )
-                if isinstance(ret, tuple):
-                    result_holder["response"], result_holder["history"] = ret
-                else:
-                    result_holder["response"] = ret
-                    result_holder["history"] = None
-            except Exception as e:
-                result_holder["error"] = str(e)
+            def _worker():
+                try:
+                    ret = model.chat(
+                        tokenizer=tokenizer,
+                        pixel_values=pixel_values,
+                        question=question,
+                        generation_config=generation_config,
+                        num_patches_list=num_patches_list if pixel_values is not None else None,
+                        history=history,
+                        return_history=True,
+                    )
+                    if isinstance(ret, tuple):
+                        result_holder["response"], result_holder["history"] = ret
+                    else:
+                        result_holder["response"] = ret
+                        result_holder["history"] = None
+                except Exception as e:
+                    result_holder["error"] = str(e)
+                    result_holder["error_type"] = e.__class__.__name__
 
-        t = Thread(target=_worker, daemon=True)
-        t.start()
+            t = Thread(target=_worker, daemon=True)
+            t.start()
+            yield sse_format({"type": "status", "stage": "generation_started"})
 
-        # 同步生成器：迭代 streamer，逐块吐出 token
-        accumulated = []
-        for piece in streamer:
-            try:
-                accumulated.append(piece)
-                yield sse_format({"type": "token", "content": piece})
-            except GeneratorExit:
-                # 客户端断开
-                break
+            # token 增量输出（带超时轮询）
+            accumulated = []
+            while True:
+                try:
+                    piece = next(streamer)
+                    if piece:
+                        accumulated.append(piece)
+                        yield sse_format({"type": "token", "content": piece})
+                    continue
+                except StopIteration:
+                    break
+                except Exception:
+                    # 轮询错误状态或是否需要重试
+                    err = result_holder.get("error")
+                    if err is not None:
+                        is_oom = (result_holder.get("error_type") in ("OutOfMemoryError", "RuntimeError")) and ("out of memory" in err.lower())
+                        if is_oom and not text_only_fallback_used and attempt < max_attempts:
+                            # 降档/重试：先清理资源
+                            try:
+                                t.join(timeout=1.0)
+                            except Exception:
+                                pass
+                            # 降低块数与 token
+                            new_rgb = max(1, cur_rgb_blocks // 2)
+                            new_ir = max(1, cur_ir_blocks // 2)
+                            new_tokens = max(96, cur_max_new_tokens // 2)
+                            # 若已经降到 1 仍 OOM，则切换纯文本
+                            if new_rgb == cur_rgb_blocks and new_ir == cur_ir_blocks:
+                                text_only_fallback_used = True
+                                yield sse_format({"type": "status", "stage": "retry_fallback_text_only", "reason": "oom"})
+                            else:
+                                yield sse_format({"type": "status", "stage": "retry_lower_blocks", "reason": "oom", "rgb_blocks": int(new_rgb), "ir_blocks": int(new_ir), "max_new_tokens": int(new_tokens)})
+                                cur_rgb_blocks, cur_ir_blocks = new_rgb, new_ir
+                                cur_max_new_tokens = new_tokens
+                            # 清理本轮张量，进入下一轮尝试
+                            try:
+                                del pixel_values1, pixel_values2
+                            except Exception:
+                                pass
+                            try:
+                                if pixel_values is not None:
+                                    del pixel_values
+                            except Exception:
+                                pass
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                try:
+                                    torch.cuda.ipc_collect()
+                                except Exception:
+                                    pass
+                            # 重启外层 while，开始新一轮
+                            break
+                        else:
+                            # 非 OOM 或无法重试，直接报错并结束
+                            yield sse_format({"type": "error", "message": err})
+                            return
+                    else:
+                        # 无错误：等待下一次轮询，发心跳
+                        yield sse_format({"type": "status", "stage": "waiting_token"})
+                        continue
 
-        # 等待生成线程结束
-        t.join(timeout=5.0)
+            # 检查是否是因为 OOM 触发的“break”准备重试
+            if result_holder.get("error") and ("out of memory" in result_holder["error"].lower()) and (attempt < max_attempts):
+                # 继续外层 while 进行重试
+                continue
 
-        # 确认最终文本（优先用我们累积的）
-        final_text = "".join(accumulated)
-        if not final_text:
-            final_text = result_holder.get("response") or ""
-
-        if result_holder.get("error"):
-            yield sse_format({"type": "error", "message": result_holder["error"]})
-            return
-
-        # 结束事件（仅携带文本，结构化结果由外层解析）
-        yield sse_format({"type": "done", "content": final_text})
-
+            # 正常结束或非可重试错误之后：收尾
+            t.join(timeout=10.0)
+            final_text = "".join(accumulated) or (result_holder.get("response") or "")
+            if result_holder.get("error") and final_text == "":
+                # 最终以 error 结束
+                yield sse_format({"type": "error", "message": result_holder["error"]})
+                return
+            # 结束事件（仅携带文本，结构化结果由外层解析）
+            yield sse_format({"type": "done", "content": final_text})
+            # 成功完成，退出外层尝试循环
+            break
     finally:
         _cleanup()
 
@@ -1530,6 +1650,37 @@ async def batch_infer_project(project_id: int, body: BatchInferBody):
 # ==============================================================================
 # 5. 服务启动入口
 # ==============================================================================
+
+# 附加：GET 版本 SSE 便于前端 EventSource 调用
+@app.get(
+    "/v1/consistency/stream",
+    summary="[SSE] 使用会话缓存和给定 content 发起一轮对话（仅流式）"
+)
+async def stream_with_session(session_id: str, content: str):
+    sess_dir = _session_dir_by_sid(session_id)
+    with session_lock:
+        meta = _load_json(os.path.join(sess_dir, "meta.json")) or {}
+    if not meta:
+        raise HTTPException(status_code=400, detail="未找到会话缓存，请先通过 POST 首轮上传图像与文本。")
+    rgb_path = os.path.join(sess_dir, "rgb.jpg")
+    ir_path = os.path.join(sess_dir, "ir.jpg")
+    if not (os.path.exists(rgb_path) and os.path.exists(ir_path)):
+        raise HTTPException(status_code=400, detail="会话缓存不完整：缺少图像。")
+    final_text = meta.get("text")
+    history = meta.get("history")
+
+    def _gen():
+        # 起始
+        yield sse_format({"type": "start", "message": "stream started"})
+        for evt in stream_chat(rgb_path, ir_path, final_text, content, history):
+            yield evt
+        # done 事件包含在 stream_chat 内部
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(_gen(), media_type="text/event-stream; charset=utf-8", headers=headers)
 
 if __name__ == "__main__":
     # 确保启动的是本文件的多卡应用
