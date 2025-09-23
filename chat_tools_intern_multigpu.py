@@ -11,7 +11,7 @@ import asyncio
 import httpx
 import uvicorn
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, Form, HTTPException, File
+from fastapi import FastAPI, UploadFile, Form, HTTPException, File, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -1032,6 +1032,7 @@ async def list_project_datasets(project_id: int):
     summary="[算法执行] 分析数据并自动回调更新接口"
 )
 async def analyze_consistency(
+    request: Request,
     session_id: str = Form(...),
     # 可选：用于首轮写入或后续回调；若不提供且会话中也没有，则跳过回调
     # project_id: Optional[int] = Form(None),
@@ -1047,8 +1048,6 @@ async def analyze_consistency(
     # 因此这里用字符串参数吸收占位，另行提供 *_file 作为实际文件字段
     rgb_image: Optional[str] = Form(None),
     infrared_image: Optional[str] = Form(None),
-    rgb_image_file: Optional[UploadFile] = File(None),
-    infrared_image_file: Optional[UploadFile] = File(None),
     text: Optional[str] = Form(None),
     # 新增：额外用户内容（例如附加提示）与历史对话
     content: Optional[str] = Form(None),
@@ -1064,19 +1063,20 @@ async def analyze_consistency(
     content = _normalize_form_str(content)
     history_json = _normalize_form_str(history_json)
 
-    # 兼容：处理 Swagger 可能提交的“空文件字段”（filename 为空或 size 为 0）
-    if isinstance(rgb_image_file, UploadFile):
-        try:
-            if not rgb_image_file.filename:
-                rgb_image_file = None
-        except Exception:
-            pass
-    if isinstance(infrared_image_file, UploadFile):
-        try:
-            if not infrared_image_file.filename:
-                infrared_image_file = None
-        except Exception:
-            pass
+    # 兼容：从原始表单读取文件字段，吞掉空字符串/空文件占位
+    try:
+        form_data = await request.form()
+    except Exception:
+        form_data = None
+    rgb_image_file = None
+    infrared_image_file = None
+    if form_data is not None:
+        cand = form_data.get("rgb_image_file")
+        if isinstance(cand, UploadFile) and getattr(cand, "filename", None):
+            rgb_image_file = cand
+        cand = form_data.get("infrared_image_file")
+        if isinstance(cand, UploadFile) and getattr(cand, "filename", None):
+            infrared_image_file = cand
 
     # 状态化：基于 session_id 读取/写入会话缓存
     sess_dir = _session_dir_by_sid(session_id)
