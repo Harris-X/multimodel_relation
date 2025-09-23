@@ -11,7 +11,7 @@ import asyncio
 import httpx
 import uvicorn
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, Form, HTTPException
+from fastapi import FastAPI, UploadFile, Form, HTTPException, File
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -483,6 +483,27 @@ def sse_format(data_obj: dict) -> bytes:
     """将字典序列化为 SSE 帧（data: json\n\n）。"""
     payload = json.dumps(data_obj, ensure_ascii=False)
     return (f"data: {payload}\n\n").encode("utf-8")
+
+
+# --- 通用：清洗 Swagger 等客户端默认占位字符串 ---
+def _normalize_form_str(v: Optional[str]) -> Optional[str]:
+    """
+    将表单中的占位值统一视为未提供：None。
+    典型占位："string"、"null"、"none"、"undefined"、空串等（不区分大小写）。
+    """
+    if v is None:
+        return None
+    try:
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode("utf-8", "ignore")
+    except Exception:
+        pass
+    s = str(v).strip()
+    if not s:
+        return None
+    if s.lower() in {"string", "null", "none", "undefined", "na", "n/a"}:
+        return None
+    return s
 
 
 def stream_chat(
@@ -1022,8 +1043,12 @@ async def analyze_consistency(
     text_json_url: Optional[str] = Form(None),
 
     # 兼容：文件直传 + 原始文本
-    rgb_image: Optional[UploadFile] = None,
-    infrared_image: Optional[UploadFile] = None,
+    # 注意：Swagger/部分客户端在未选择文件时会提交空字符串，
+    # 因此这里用字符串参数吸收占位，另行提供 *_file 作为实际文件字段
+    rgb_image: Optional[str] = Form(None),
+    infrared_image: Optional[str] = Form(None),
+    rgb_image_file: Optional[UploadFile] = File(None),
+    infrared_image_file: Optional[UploadFile] = File(None),
     text: Optional[str] = Form(None),
     # 新增：额外用户内容（例如附加提示）与历史对话
     content: Optional[str] = Form(None),
@@ -1031,6 +1056,28 @@ async def analyze_consistency(
     # 是否启用 SSE 流式输出
     stream: Optional[bool] = Form(False),
 ):
+    # 预清洗：将 Swagger 的默认占位字符串归一为 None
+    rgb_image_url = _normalize_form_str(rgb_image_url)
+    infrared_image_url = _normalize_form_str(infrared_image_url)
+    text_json_url = _normalize_form_str(text_json_url)
+    text = _normalize_form_str(text)
+    content = _normalize_form_str(content)
+    history_json = _normalize_form_str(history_json)
+
+    # 兼容：处理 Swagger 可能提交的“空文件字段”（filename 为空或 size 为 0）
+    if isinstance(rgb_image_file, UploadFile):
+        try:
+            if not rgb_image_file.filename:
+                rgb_image_file = None
+        except Exception:
+            pass
+    if isinstance(infrared_image_file, UploadFile):
+        try:
+            if not infrared_image_file.filename:
+                infrared_image_file = None
+        except Exception:
+            pass
+
     # 状态化：基于 session_id 读取/写入会话缓存
     sess_dir = _session_dir_by_sid(session_id)
     _ensure_dir(SESSIONS_DIR)
@@ -1038,8 +1085,15 @@ async def analyze_consistency(
     with session_lock:
         cached = _load_json(os.path.join(sess_dir, "meta.json"))
 
-    # 从缓存恢复或接收新输入
-    need_download_or_upload = any([rgb_image_url, infrared_image_url, text_json_url, rgb_image is not None, infrared_image is not None, text is not None])
+    # 从缓存恢复或接收新输入（基于清洗后的值判断）
+    need_download_or_upload = any([
+        bool(rgb_image_url),
+        bool(infrared_image_url),
+        bool(text_json_url),
+        rgb_image_file is not None,
+        infrared_image_file is not None,
+        bool(text),
+    ])
 
     # 将历史合并：优先使用传入的 history_json，否则使用缓存中的 history
     incoming_history = None
@@ -1071,9 +1125,9 @@ async def analyze_consistency(
                             if not os.path.exists(rgb_image_url):
                                 raise HTTPException(status_code=400, detail=f"RGB图像路径不存在: {rgb_image_url}")
                             tmp_rgb = rgb_image_url
-                    elif rgb_image is not None:
-                        tmp_rgb = os.path.join(temp_dir, f"{uuid.uuid4()}_{rgb_image.filename}")
-                        with open(tmp_rgb, "wb") as f: f.write(await rgb_image.read())
+                    elif rgb_image_file is not None:
+                        tmp_rgb = os.path.join(temp_dir, f"{uuid.uuid4()}_{rgb_image_file.filename}")
+                        with open(tmp_rgb, "wb") as f: f.write(await rgb_image_file.read())
                     else:
                         tmp_rgb = None
 
@@ -1087,9 +1141,9 @@ async def analyze_consistency(
                             if not os.path.exists(infrared_image_url):
                                 raise HTTPException(status_code=400, detail=f"红外图像路径不存在: {infrared_image_url}")
                             tmp_ir = infrared_image_url
-                    elif infrared_image is not None:
-                        tmp_ir = os.path.join(temp_dir, f"{uuid.uuid4()}_{infrared_image.filename}")
-                        with open(tmp_ir, "wb") as f: f.write(await infrared_image.read())
+                    elif infrared_image_file is not None:
+                        tmp_ir = os.path.join(temp_dir, f"{uuid.uuid4()}_{infrared_image_file.filename}")
+                        with open(tmp_ir, "wb") as f: f.write(await infrared_image_file.read())
                     else:
                         tmp_ir = None
 
