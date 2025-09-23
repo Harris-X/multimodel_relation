@@ -3,6 +3,7 @@ import os
 import shutil
 import torch
 from transformers import AutoTokenizer, AutoModel
+from transformers import TextIteratorStreamer
 from PIL import Image
 import re
 import csv
@@ -12,6 +13,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, Form, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from enum import Enum
 from typing import Optional
@@ -19,7 +21,7 @@ import tempfile
 import uuid
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
-from threading import RLock
+from threading import RLock, Thread
 from urllib.parse import urlparse
 
 # ==============================================================================
@@ -438,6 +440,145 @@ def chat(
             # 再次失败则抛出，由上层返回 500
             raise
 
+
+def sse_format(data_obj: dict) -> bytes:
+    """将字典序列化为 SSE 帧（data: json\n\n）。"""
+    payload = json.dumps(data_obj, ensure_ascii=False)
+    return (f"data: {payload}\n\n").encode("utf-8")
+
+
+def stream_chat(
+    image1_path: str,
+    image2_path: str,
+    text: str,
+    extra_content: str | None = None,
+    history=None,
+):
+    """
+    基于模型的 chat 接口，通过 TextIteratorStreamer 实现增量流式输出。
+    注意：该函数返回一个同步生成器，适合用于 StreamingResponse。
+    """
+    tokenizer = model_globals["tokenizer"]
+    model = model_globals["model"]
+    in_dtype = model_globals.get("dtype", torch.bfloat16)
+    if not tokenizer or not model:
+        raise RuntimeError("模型尚未加载。")
+
+    # 读取默认参数
+    img_input_size = int(os.environ.get("IMG_INPUT_SIZE", "448"))
+    rgb_max_blocks = int(os.environ.get("RGB_MAX_BLOCKS", "8"))
+    ir_max_blocks = int(os.environ.get("IR_MAX_BLOCKS", "6"))
+    max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "256"))
+
+    # 预处理图像（与 chat 一致）
+    pixel_values = None
+    pixel_values1 = None
+    pixel_values2 = None
+    num_patches_list = None
+
+    def _cleanup():
+        try:
+            del pixel_values1, pixel_values2
+        except Exception:
+            pass
+        try:
+            if pixel_values is not None:
+                del pixel_values
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+    try:
+        pixel_values1 = load_image(image1_path, input_size=img_input_size, max_num=rgb_max_blocks)
+        pixel_values2 = load_image(image2_path, input_size=img_input_size, max_num=ir_max_blocks)
+        num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
+        pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
+
+        # 多 GPU：单卡时放到 cuda:0，多卡让 HF 处理
+        if torch.cuda.is_available():
+            hf_map = getattr(model, "hf_device_map", None)
+            if isinstance(hf_map, dict):
+                gpu_set = {str(v) for v in hf_map.values() if (isinstance(v, str) and v.startswith("cuda:")) or isinstance(v, int)}
+                multi_gpu = len(gpu_set) >= 2
+            else:
+                multi_gpu = torch.cuda.device_count() >= 2
+            if not multi_gpu:
+                pixel_values = pixel_values.to(torch.device("cuda:0"), non_blocking=True)
+
+        # 问题构造（与 chat 一致）
+        is_first_turn = not history
+        if is_first_turn:
+            question = build_initial_messages(prompt, text, extra_content=extra_content)
+        else:
+            question = (extra_content or "请继续").strip()
+
+        # 构造 streamer 并在子线程中运行 model.chat
+        streamer = TextIteratorStreamer(tokenizer=tokenizer, skip_prompt=True, skip_special_tokens=True)
+        generation_config = dict(
+            max_new_tokens=int(max_new_tokens),
+            do_sample=False,
+            temperature=0.6,
+            repetition_penalty=1.05,
+            streamer=streamer,  # 关键：启用流式
+        )
+
+        result_holder = {"response": "", "history": None, "error": None}
+
+        def _worker():
+            try:
+                ret = model.chat(
+                    tokenizer=tokenizer,
+                    pixel_values=pixel_values,
+                    question=question,
+                    generation_config=generation_config,
+                    num_patches_list=num_patches_list,
+                    history=history,
+                    return_history=True,
+                )
+                if isinstance(ret, tuple):
+                    result_holder["response"], result_holder["history"] = ret
+                else:
+                    result_holder["response"] = ret
+                    result_holder["history"] = None
+            except Exception as e:
+                result_holder["error"] = str(e)
+
+        t = Thread(target=_worker, daemon=True)
+        t.start()
+
+        # 同步生成器：迭代 streamer，逐块吐出 token
+        accumulated = []
+        for piece in streamer:
+            try:
+                accumulated.append(piece)
+                yield sse_format({"type": "token", "content": piece})
+            except GeneratorExit:
+                # 客户端断开
+                break
+
+        # 等待生成线程结束
+        t.join(timeout=5.0)
+
+        # 确认最终文本（优先用我们累积的）
+        final_text = "".join(accumulated)
+        if not final_text:
+            final_text = result_holder.get("response") or ""
+
+        if result_holder.get("error"):
+            yield sse_format({"type": "error", "message": result_holder["error"]})
+            return
+
+        # 结束事件（仅携带文本，结构化结果由外层解析）
+        yield sse_format({"type": "done", "content": final_text})
+
+    finally:
+        _cleanup()
+
 def extract_first_paragraph_after_answer(s: str) -> str:
     # 思考模式会产生 <think>...</think> 块，答案在后面
     # 使用 re.S 使 '.' 可以匹配换行符
@@ -527,6 +668,9 @@ def _session_key(project_id: int, dataset_id: int) -> str:
 
 def _session_dir(project_id: int, dataset_id: int) -> str:
     return os.path.join(SESSIONS_DIR, _session_key(project_id, dataset_id))
+
+def _session_dir_by_sid(session_id: str) -> str:
+    return os.path.join(SESSIONS_DIR, str(session_id))
 
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
@@ -747,8 +891,10 @@ async def list_project_datasets(project_id: int):
     summary="[算法执行] 分析数据并自动回调更新接口"
 )
 async def analyze_consistency(
-    project_id: int = Form(...),
-    dataset_id: int = Form(...),
+    session_id: str = Form(...),
+    # 可选：用于首轮写入或后续回调；若不提供且会话中也没有，则跳过回调
+    # project_id: Optional[int] = Form(None),
+    # dataset_id: Optional[int] = Form(None),
 
     # 现在既支持 http(s) URL 也支持服务器本地路径
     rgb_image_url: Optional[str] = Form(None),
@@ -762,9 +908,11 @@ async def analyze_consistency(
     # 新增：额外用户内容（例如附加提示）与历史对话
     content: Optional[str] = Form(None),
     history_json: Optional[str] = Form(None),
+    # 是否启用 SSE 流式输出
+    stream: Optional[bool] = Form(False),
 ):
-    # 状态化：优先从 session_cache 读取已缓存的图像、文本与历史；若本次提供了新的输入，则更新缓存
-    sess_dir = _session_dir(project_id, dataset_id)
+    # 状态化：基于 session_id 读取/写入会话缓存
+    sess_dir = _session_dir_by_sid(session_id)
     _ensure_dir(SESSIONS_DIR)
     cached = None
     with session_lock:
@@ -868,8 +1016,14 @@ async def analyze_consistency(
                     elif cached and os.path.exists(os.path.join(sess_dir, "ir.jpg")):
                         ir_path = os.path.join(sess_dir, "ir.jpg")
 
-                    # 保存文本与标签
+                    # 保存文本与标签/会话元信息
                     meta = _load_json(os.path.join(sess_dir, "meta.json")) or {}
+                    # session 基本信息
+                    meta["session_id"] = session_id
+                    # if project_id is not None:
+                    #     meta["project_id"] = project_id
+                    # if dataset_id is not None:
+                    #     meta["dataset_id"] = dataset_id
                     if final_text is not None:
                         meta["text"] = final_text
                     if label is not None:
@@ -909,92 +1063,178 @@ async def analyze_consistency(
         if not isinstance(history, (list, type(None))):
             history = None
 
-    # 进行模型推理
-    try:
-        print(f"开始为 project:{project_id} dataset:{dataset_id} 进行模型推理...")
-        chat_result = await run_in_threadpool(chat, rgb_path, ir_path, final_text, content, history, True)
-        if isinstance(chat_result, tuple):
-            model_response, new_history = chat_result
-        else:
-            model_response, new_history = chat_result, None
+    # 分支：SSE 流式 or 常规一次性
+    if stream:
+        # 以流式方式返回 token，并在结束时输出最终结果事件
+        def _sse_generator():
+            # 1) 先逐 token 推送
+            final_text_holder = {"text": ""}
+            try:
+                for evt in stream_chat(rgb_path, ir_path, final_text, content, history):
+                    # 捕获 done 事件内容
+                    try:
+                        obj = json.loads(evt.decode("utf-8").split("data: ", 1)[1])
+                    except Exception:
+                        obj = None
+                    if obj and obj.get("type") == "done":
+                        final_text_holder["text"] = obj.get("content", "")
+                    yield evt
+            except Exception as e:
+                yield sse_format({"type": "error", "message": str(e)})
+                return
 
-        # 将新的历史写回缓存
-        with session_lock:
-            meta = _load_json(os.path.join(sess_dir, "meta.json")) or {}
-            meta["history"] = new_history
-            _save_json(os.path.join(sess_dir, "meta.json"), meta)
+            # 2) 生成结束后，解析最终结果并写回历史
+            model_response = final_text_holder["text"]
 
-        # 解析模型输出
-        parsed_result = check_label_re(model_response)
-        overall_inference = extract_overall_inference(model_response)
+            # 将新的历史写回缓存（由于 stream_chat 内部 history 追加是在模型侧完成，这里简单读回）
+            with session_lock:
+                meta = _load_json(os.path.join(sess_dir, "meta.json")) or {}
+                # 保险起见，将最后一轮问答补充到历史
+                old_hist = meta.get("history") or []
+                is_first_turn_local = not old_hist
+                q = build_initial_messages(prompt, final_text, extra_content=content) if is_first_turn_local else (content or "请继续").strip()
+                old_hist.append((q, model_response))
+                meta["history"] = old_hist
+                _save_json(os.path.join(sess_dir, "meta.json"), meta)
+                new_history_local = old_hist
 
-        rels = {
-            tuple(sorted(r["entities"])): r["type"]
-            for r in parsed_result.get("relationships", [])
+            try:
+                parsed_result = check_label_re(model_response)
+                overall_inference = extract_overall_inference(model_response)
+
+                rels = {tuple(sorted(r["entities"])): r["type"] for r in parsed_result.get("relationships", [])}
+                rgb_ir_key = tuple(sorted(['图片1', '图片2']))
+                text_ir_key = tuple(sorted(['文本1', '图片2']))
+                rgb_text_key = tuple(sorted(['图片1', '文本1']))
+                final_key = tuple(sorted(['图片1', '图片2', '文本1']))
+                pred_raw = rels.get(final_key)
+                pred = normalize_relation_name(pred_raw)
+
+                consistency_result_value = overall_inference
+                consistency_result_accuracy = 1.0 if consistency_result_label == overall_inference else 0.0
+                accuracy = 1.0 if (pred == label and label is not None) else 0.0
+
+                update_data_local = UpdateDatasetBody(
+                    rgb_infrared_relation=rels.get(rgb_ir_key, "未知"),
+                    text_infrared_relation=rels.get(text_ir_key, "未知"),
+                    rgb_text_relation=rels.get(rgb_text_key, "未知"),
+                    final_relation=rels.get(final_key, "未知"),
+                    actual_relation=label or "未知",
+                    accuracy=accuracy,
+                    consistency_result=consistency_result_value or "None",
+                    consistency_result_accuracy=consistency_result_accuracy,
+                    raw_model_output=model_response
+                )
+            except Exception as e:
+                yield sse_format({"type": "error", "message": f"解析失败: {e}"})
+                return
+
+            # 3) 最终结构化结果事件
+            yield sse_format({
+                "type": "final",
+                "result": {
+                    "callback_data": update_data_local.dict(),
+                    "raw_model_output": model_response,
+                    "history": new_history_local,
+                }
+            })
+
+        headers = {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
         }
+        return StreamingResponse(_sse_generator(), media_type="text/event-stream", headers=headers)
+    else:
+        # 进行模型推理（一次性返回）
+        try:
+            print(f"开始推理 session:{session_id} ...")
+            chat_result = await run_in_threadpool(chat, rgb_path, ir_path, final_text, content, history, True)
+            if isinstance(chat_result, tuple):
+                model_response, new_history = chat_result
+            else:
+                model_response, new_history = chat_result, None
 
-        rgb_ir_key = tuple(sorted(['图片1', '图片2']))
-        text_ir_key = tuple(sorted(['文本1', '图片2']))
-        rgb_text_key = tuple(sorted(['图片1', '文本1']))
-        final_key = tuple(sorted(['图片1', '图片2', '文本1']))
-        pred_raw = rels.get(final_key)
-        pred = normalize_relation_name(pred_raw)
+            # 将新的历史写回缓存
+            with session_lock:
+                meta = _load_json(os.path.join(sess_dir, "meta.json")) or {}
+                meta["history"] = new_history
+                _save_json(os.path.join(sess_dir, "meta.json"), meta)
 
-        consistency_result_value = overall_inference
-        if consistency_result_label == overall_inference:
-            consistency_result_accuracy = 1.0
-        else:
-            consistency_result_accuracy = 0.0
+            # 解析模型输出
+            parsed_result = check_label_re(model_response)
+            overall_inference = extract_overall_inference(model_response)
 
-        if pred == label and label is not None:
-            accuracy = 1.0
-        else:
-            accuracy = 0.0
+            rels = {
+                tuple(sorted(r["entities"])): r["type"]
+                for r in parsed_result.get("relationships", [])
+            }
 
-        update_data = UpdateDatasetBody(
-            rgb_infrared_relation=rels.get(rgb_ir_key, "未知"),
-            text_infrared_relation=rels.get(text_ir_key, "未知"),
-            rgb_text_relation=rels.get(rgb_text_key, "未知"),
-            final_relation=rels.get(final_key, "未知"),
-            actual_relation=label or "未知",  # 新增：标准答案标签
-            accuracy=accuracy,
-            consistency_result=consistency_result_value or "None",
-            consistency_result_accuracy=consistency_result_accuracy,
-            raw_model_output=model_response  # 新增：持久化模型原始输出
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"模型推理或结果解析失败: {e}")
+            rgb_ir_key = tuple(sorted(['图片1', '图片2']))
+            text_ir_key = tuple(sorted(['文本1', '图片2']))
+            rgb_text_key = tuple(sorted(['图片1', '文本1']))
+            final_key = tuple(sorted(['图片1', '图片2', '文本1']))
+            pred_raw = rels.get(final_key)
+            pred = normalize_relation_name(pred_raw)
 
-    callback_url = f"{base_url}/v1/consistency/infer/{project_id}/{dataset_id}"
-    try:
-        async with httpx.AsyncClient() as client:
-            print(f"正在向 {callback_url} 发送回调...")
-            response = await client.put(callback_url, json=update_data.dict())
-            response.raise_for_status()
-            callback_resp_json = response.json()
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"回调失败: 无法连接到更新接口 at {e.request.url!r}.")
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"回调接口返回错误: {e.response.status_code} - {e.response.text}"
-        )
+            consistency_result_value = overall_inference
+            if consistency_result_label == overall_inference:
+                consistency_result_accuracy = 1.0
+            else:
+                consistency_result_accuracy = 0.0
 
-    return {
-        "code": 200,
-        "message": "分析完成并已触发回调",
-        "result": {
-            "parsed_relations": parsed_result,
-            "overall_inference": overall_inference,
-            "callback_data": update_data.dict(),
-            "raw_model_output": model_response,
-            "callback_response": callback_resp_json,
-            "history": new_history,  # 回传新的历史（仅单条接口返回）
-            # 直接回传构造的 question 便于前端调试（可选）
+            if pred == label and label is not None:
+                accuracy = 1.0
+            else:
+                accuracy = 0.0
+
+            update_data = UpdateDatasetBody(
+                rgb_infrared_relation=rels.get(rgb_ir_key, "未知"),
+                text_infrared_relation=rels.get(text_ir_key, "未知"),
+                rgb_text_relation=rels.get(rgb_text_key, "未知"),
+                final_relation=rels.get(final_key, "未知"),
+                actual_relation=label or "未知",  # 新增：标准答案标签
+                accuracy=accuracy,
+                consistency_result=consistency_result_value or "None",
+                consistency_result_accuracy=consistency_result_accuracy,
+                raw_model_output=model_response  # 新增：持久化模型原始输出
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"模型推理或结果解析失败: {e}")
+
+    # # 回调：优先使用入参 project_id/dataset_id；若缺省则尝试从会话元信息读取；否则跳过回调
+    # callback_resp_json = None
+    # with session_lock:
+    #     meta = _load_json(os.path.join(sess_dir, "meta.json")) or {}
+    #     proj_for_cb = project_id if project_id is not None else meta.get("project_id")
+    #     ds_for_cb = dataset_id if dataset_id is not None else meta.get("dataset_id")
+
+    # if proj_for_cb is not None and ds_for_cb is not None:
+    #     callback_url = f"{base_url}/v1/consistency/infer/{proj_for_cb}/{ds_for_cb}"
+    #     try:
+    #         async with httpx.AsyncClient() as client:
+    #             print(f"正在向 {callback_url} 发送回调...")
+    #             response = await client.put(callback_url, json=update_data.dict())
+    #             response.raise_for_status()
+    #             callback_resp_json = response.json()
+    #     except httpx.RequestError as e:
+    #         raise HTTPException(status_code=502, detail=f"回调失败: 无法连接到更新接口 at {e.request.url!r}.")
+    #     except httpx.HTTPStatusError as e:
+    #         raise HTTPException(
+    #             status_code=502,
+    #             detail=f"回调接口返回错误: {e.response.status_code} - {e.response.text}"
+    #         )
+
+        return {
+            "code": 200,
+            "message": "分析完成并已触发回调",
+            "result": {
+                "callback_data": update_data.dict(),
+                "raw_model_output": model_response,
+                "history": new_history,
+            }
         }
-    }
 
 
 
