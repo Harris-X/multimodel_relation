@@ -27,7 +27,8 @@ from urllib.parse import urlparse
 # ==============================================================================
 # 1. 服务与模型配置
 # ==============================================================================
-base_url = "http://localhost:8102"
+# 回调基础地址：支持通过环境变量 CALLBACK_BASE_URL 覆盖，默认使用当前硬编码地址
+base_url = os.environ.get("CALLBACK_BASE_URL", "http://121.48.162.151:18000").rstrip('/')
 # 从环境变量读取配置（不要在代码里强行覆盖 CUDA_VISIBLE_DEVICES）
 # 可在启动前导出:  export CUDA_VISIBLE_DEVICES=0,1,2
 # os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # <- 删除这类硬编码
@@ -416,7 +417,7 @@ def chat(
     img_input_size = int(os.environ.get("IMG_INPUT_SIZE", "448"))
     rgb_max_blocks = int(os.environ.get("RGB_MAX_BLOCKS", "8"))
     ir_max_blocks = int(os.environ.get("IR_MAX_BLOCKS", "6"))
-    max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "256"))
+    max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "512"))
 
     # 首次尝试
     try:
@@ -505,7 +506,7 @@ def stream_chat(
     img_input_size = int(os.environ.get("IMG_INPUT_SIZE", "448"))
     rgb_max_blocks = int(os.environ.get("RGB_MAX_BLOCKS", "8"))
     ir_max_blocks = int(os.environ.get("IR_MAX_BLOCKS", "6"))
-    max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "256"))
+    max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "512"))
 
     # 预留张量句柄用于清理
     pixel_values = None
@@ -887,8 +888,8 @@ def _load_existing_update_rows(project_id: int, dataset_ids: list[str]) -> dict[
                 reader = csv.DictReader(f)
                 for row in reader:
                     # 仅读取当前项目的数据，避免串项目
-                    if row.get("project_id") != str(project_id):
-                        continue
+                    # if row.get("project_id") != str(project_id):
+                    #     continue
                     dsid = row.get("dataset_id")
                     if dsid not in wanted:
                         continue
@@ -953,7 +954,7 @@ async def get_single_dataset(project_id: int, dataset_id: int):
     raise HTTPException(status_code=404, detail="结果未找到。")
 
 @app.put(
-    "/v1/consistency/infer/{project_id}",
+    "/v1/consistency/project/{project_id}",
     summary="[回调接收] 模拟更新项目级聚合结果"
 )
 async def update_project_summary(project_id: int, body: UpdateProjectBody):
@@ -966,7 +967,6 @@ async def update_project_summary(project_id: int, body: UpdateProjectBody):
 
     header = ["project_id"] + list(UpdateProjectBody.__annotations__.keys())
     new_row = {"project_id": project_id, **body.dict()}
-
     await run_in_threadpool(_update_or_append_csv, PROJECT_RESULTS_FILE, header, new_row, ["project_id"])
 
     return {"code": 200, "message": "success", "data": new_row}
@@ -1464,11 +1464,15 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
                         # 复用外层 client，避免覆盖导致已关闭的 client 被使用
                         print(f"正在向 {callback_url} 发送回调...")
                         response = await client.put(callback_url, json=update_row.dict())
+                        # 记录回调响应
+                        resp_text = (response.text or "")
+                        print(f"[CALLBACK][dataset {dsid}] status={response.status_code}, body={resp_text[:200]!r}")
                         response.raise_for_status()
-                        callback_resp_json = response.json()
                     except httpx.RequestError as e:
-                        raise HTTPException(status_code=502, detail=f"回调失败: 无法连接到更新接口 at {e.request.url!r}.")
+                        print(f"[CALLBACK][dataset {dsid}] 连接失败: {e}")
+                        raise HTTPException(status_code=502, detail=f"回调失败: 无法连接到更新接口 at {getattr(e, 'request', None) and e.request.url!r}.")
                     except httpx.HTTPStatusError as e:
+                        print(f"[CALLBACK][dataset {dsid}] HTTP错误: status={e.response.status_code}, body={e.response.text[:200]!r}")
                         raise HTTPException(
                             status_code=502,
                             detail=f"回调接口返回错误: {e.response.status_code} - {e.response.text}"
@@ -1504,8 +1508,9 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
             async with httpx.AsyncClient(timeout=30.0) as client:
                 print(f"正在向 {callback_url} 发送回调...")
                 response = await client.put(callback_url, json=update_data.dict())
+                resp_text = (response.text or "")
+                print(f"[CALLBACK][cached dataset {dataset_id}] status={response.status_code}, body={resp_text[:200]!r}")
                 response.raise_for_status()
-                _ = response.json()
         except Exception as e:
             # 降级为日志，避免中断整个批任务
             print(f"[BATCH][WARN] 缓存样本回调失败 dataset_id={dataset_id}: {e}")
@@ -1588,7 +1593,7 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
     await run_in_threadpool(_update_or_append_csv, PROJECT_RESULTS_FILE, proj_header, proj_row, ["project_id"])
 
     # 新增：通过 HTTP PUT 回调项目级接口
-    callback_url = f"{base_url}/v1/consistency/infer/{project_id}"
+    callback_url = f"{base_url}/v1/consistency/project/{project_id}"
     try:
         async with httpx.AsyncClient() as client:
             print(f"[Project] 正在向 {callback_url} 发送回调...")
