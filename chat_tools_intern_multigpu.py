@@ -1067,6 +1067,8 @@ async def analyze_consistency(
     if stream:
         # 以流式方式返回 token，并在结束时输出最终结果事件
         def _sse_generator():
+            # 0) 立即推送一个起始事件，避免客户端/代理长时间无输出
+            yield sse_format({"type": "start", "message": "stream started"})
             # 1) 先逐 token 推送
             final_text_holder = {"text": ""}
             try:
@@ -1142,8 +1144,10 @@ async def analyze_consistency(
         headers = {
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            # 关闭 Nginx 等代理的输出缓冲，确保事件及时发送
+            "X-Accel-Buffering": "no",
         }
-        return StreamingResponse(_sse_generator(), media_type="text/event-stream", headers=headers)
+        return StreamingResponse(_sse_generator(), media_type="text/event-stream; charset=utf-8", headers=headers)
     else:
         # 进行模型推理（一次性返回）
         try:
