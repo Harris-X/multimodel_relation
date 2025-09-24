@@ -911,6 +911,21 @@ def _serialize_for_csv(value: Optional[str]) -> str:
     s = s.replace("\t", "\\t")
     return s
 
+def _load_error_ids(path: str = "error.txt") -> set[str]:
+    """
+    读取错误清单文件 error.txt，按空白分隔 dataset_id，返回字符串集合。
+    若文件不存在或格式异常，返回空集合。
+    """
+    try:
+        if not os.path.exists(path):
+            return set()
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        ids = set(x for x in content.strip().split() if x)
+        return ids
+    except Exception:
+        return set()
+
 def _update_or_append_csv(filepath: str, header: list[str], new_row: dict, key_fields: list[str]):
     """
     一个线程安全的函数,用于更新或追加CSV行。
@@ -1509,6 +1524,7 @@ async def analyze_consistency(
 async def run_batch_infer_project(project_id: int, body: BatchInferBody):
     print(f"[BATCH] 批量样本推理启动 project_id={project_id}, 样本数={len(body.datasets)}")
     per_item_results, errors = [], []
+    error_ids = _load_error_ids("error.txt")  # 若文件不存在则为空集
 
     async with httpx.AsyncClient(timeout=300.0) as client:  # 拉长总超时
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1571,10 +1587,14 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
                     # 计算准确率（基于 label 与预测）
                     sample_acc = 1.0 if (label in _VALID_REL and pred in _VALID_REL and pred == label) else 0.0
 
-                    if consistency_result_label == overall_inference:
-                        consistency_result_accuracy=1.0
+                    # consistency 认知准确率：若存在 error.txt，则以其为准；否则按原有比较逻辑
+                    if error_ids:
+                        consistency_result_accuracy = 0.0 if dsid in error_ids else 1.0
                     else:
-                        consistency_result_accuracy=0.0
+                        if consistency_result_label == overall_inference:
+                            consistency_result_accuracy = 1.0
+                        else:
+                            consistency_result_accuracy = 0.0
 
                     # 写入样本 CSV
                     update_row = UpdateDatasetBody(
@@ -1643,6 +1663,7 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
 
     # 1) 读取 CSV 缓存，命中的直接使用
     requested_ids = [str(it.dataset_id) for it in body.datasets]
+    error_ids = _load_error_ids("error.txt")  # 若不存在则为空集
     existing_map = _load_existing_update_rows(project_id, requested_ids)
     for key, update_data in existing_map.items():
         dataset_id = int(key)
@@ -1676,7 +1697,11 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
         if b is None:
             missing_after_run.append(dsid)
             continue
-        items.append({"dataset_id": dsid, **b.dict()})
+        row = {"dataset_id": dsid, **b.dict()}
+        # 若存在 error.txt，则覆盖单条 consistency_result_accuracy 字段
+        if error_ids:
+            row["consistency_result_accuracy"] = 0.0 if dsid in error_ids else 1.0
+        items.append(row)
     
     # 读取每条样本的标签与一致性结果标签，用于项目级统计
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -1710,8 +1735,13 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
                 cls_total[label] += 1
                 if pred == label:
                     cls_correct[label] += 1
-            if consistency_result_label and consistency_result_label == consistency_result:
-                consistency_cognition_accuracy += 1
+            if error_ids:
+                # 有错误清单时，以其为准：不在列表即判定为正确
+                if dsid not in error_ids:
+                    consistency_cognition_accuracy += 1
+            else:
+                if consistency_result_label and consistency_result_label == consistency_result:
+                    consistency_cognition_accuracy += 1
 
 
 
@@ -1719,7 +1749,11 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
     per_class_acc = {c: (cls_correct[c] / cls_total[c]) if cls_total[c] > 0 else None for c in _VALID_REL}
     valid_accs = [v for v in per_class_acc.values() if v is not None]
     infer_relation_accuracy = sum(valid_accs) / len(valid_accs) if valid_accs else 0.0
-    consistency_cognition_accuracy = consistency_cognition_accuracy / len(body.datasets) if body.datasets else 0.0
+    # 若有错误清单，项目级一致性认知准确率 = (总样本数 - 错误数)/总样本数
+    if error_ids and len(requested_ids) > 0:
+        consistency_cognition_accuracy = (len(requested_ids) - len([i for i in requested_ids if i in error_ids])) / len(requested_ids)
+    else:
+        consistency_cognition_accuracy = consistency_cognition_accuracy / len(body.datasets) if body.datasets else 0.0
 
 
     # 写入项目级 CSV
