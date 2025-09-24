@@ -320,26 +320,6 @@ def build_initial_messages(instruction_prompt: str, user_text: str | None, extra
     content += "\n" + instruction_prompt
     return content
 
-def build_minimal_question(user_text: str | None, extra_content: str | None = None, num_images: int = 0) -> str:
-    """
-    构造轻量问题，不包含复杂的任务提示，仅按需插入 <image> 与可选的 Text-1/User-Content。
-    - num_images: 0/1/2
-    - 当仅有图片或仅有文本时，依赖于这些最简要的输入进行回复。
-    """
-    parts: list[str] = []
-    if num_images >= 1:
-        parts.append("Image-1: <image>")
-    if num_images >= 2:
-        parts.append("Image-2: <image>")
-    if user_text:
-        parts.append(f"Text-1: {user_text}")
-    if extra_content:
-        parts.append(f"User-Content: {extra_content}")
-    if parts:
-        return "\n".join(parts)
-    # 没有任何输入时，给一个默认提示（通常不会触发，因为外层会校验）
-    return "请根据输入进行回答。"
-
 def _first_cuda_device_from_hf_map(model) -> torch.device:
     # 从 hf_device_map 找到第一块 CUDA 设备，避免固定用 cuda:0
     devs = getattr(model, "hf_device_map", None)
@@ -371,22 +351,10 @@ def chat(
         pixel_values1 = None
         pixel_values2 = None
         try:
-            pv_list = []
-            num_patches_list = []
-            # 可选加载图像1
-            if image1_path and os.path.exists(str(image1_path)):
-                pixel_values1 = load_image(image1_path, input_size=img_size, max_num=rgb_blocks)
-                pv_list.append(pixel_values1)
-                num_patches_list.append(pixel_values1.size(0))
-            # 可选加载图像2
-            if image2_path and os.path.exists(str(image2_path)):
-                pixel_values2 = load_image(image2_path, input_size=img_size, max_num=ir_blocks)
-                pv_list.append(pixel_values2)
-                num_patches_list.append(pixel_values2.size(0))
-            if pv_list:
-                pixel_values = torch.cat(tuple(pv_list), dim=0).to(in_dtype)
-            else:
-                num_patches_list = None
+            pixel_values1 = load_image(image1_path, input_size=img_size, max_num=rgb_blocks)
+            pixel_values2 = load_image(image2_path, input_size=img_size, max_num=ir_blocks)
+            num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
+            pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
 
             # 多 GPU 分片时：让 Accelerate/transformers 自行把输入分发到各分片，避免集中到单卡
             if torch.cuda.is_available():
@@ -396,19 +364,13 @@ def chat(
                     multi_gpu = len(gpu_set) >= 2
                 else:
                     multi_gpu = torch.cuda.device_count() >= 2
-                if not multi_gpu and pixel_values is not None:
+                if not multi_gpu:
                     pixel_values = pixel_values.to(torch.device("cuda:0"), non_blocking=True)
 
             # 问题构造
             is_first_turn = not history
-            has_two_images = (pixel_values1 is not None) and (pixel_values2 is not None)
-            is_triple = bool(has_two_images and text)
             if is_first_turn:
-                if is_triple:
-                    question = build_initial_messages(prompt, text, extra_content=extra_content)
-                else:
-                    num_imgs = (1 if pixel_values1 is not None else 0) + (1 if pixel_values2 is not None else 0)
-                    question = build_minimal_question(text, extra_content=extra_content, num_images=num_imgs)
+                question = build_initial_messages(prompt, text, extra_content=extra_content)
             else:
                 question = (extra_content or "请继续").strip()
 
@@ -484,10 +446,9 @@ def chat(
                 except Exception:
                     pass
             is_first_turn = not history
-            # 文本回退时，首轮也不强制注入复杂任务提示，除非满足三模态
-            # 此处已是纯文本，无图像，因此不满足三模态，使用最简问题
+            # 第二轮及以后：只用用户 content；首轮纯文本则补上系统提示
             if is_first_turn:
-                question = build_minimal_question(text, extra_content=extra_content, num_images=0)
+                question = build_initial_messages(prompt, text, extra_content=extra_content)
             else:
                 question = (extra_content or "请继续").strip()
             generation_config = dict(
@@ -605,33 +566,14 @@ def stream_chat(
             if not text_only_fallback_used:
                 yield sse_format({"type": "status", "stage": "preprocess_start"})
                 try:
-                    pv_list = []
-                    num_patches_list = []
-                    if image1_path and os.path.exists(str(image1_path)):
-                        pixel_values1 = load_image(image1_path, input_size=img_input_size, max_num=cur_rgb_blocks)
-                        pv_list.append(pixel_values1)
-                        num_patches_list.append(pixel_values1.size(0))
-                    if image2_path and os.path.exists(str(image2_path)):
-                        pixel_values2 = load_image(image2_path, input_size=img_input_size, max_num=cur_ir_blocks)
-                        pv_list.append(pixel_values2)
-                        num_patches_list.append(pixel_values2.size(0))
-                    if pv_list:
-                        pixel_values = torch.cat(tuple(pv_list), dim=0).to(in_dtype)
-                    else:
-                        num_patches_list = None
+                    pixel_values1 = load_image(image1_path, input_size=img_input_size, max_num=cur_rgb_blocks)
+                    pixel_values2 = load_image(image2_path, input_size=img_input_size, max_num=cur_ir_blocks)
                 except Exception as e:
                     yield sse_format({"type": "error", "message": f"图像预处理失败: {e}"})
                     return
-                if num_patches_list is not None:
-                    # 根据已加载的数量反馈 block 数
-                    stage_info = {"type": "status", "stage": "preprocess_done"}
-                    if len(num_patches_list) >= 1:
-                        stage_info["rgb_blocks"] = int(num_patches_list[0])
-                    if len(num_patches_list) >= 2:
-                        stage_info["ir_blocks"] = int(num_patches_list[1])
-                    yield sse_format(stage_info)
-                else:
-                    yield sse_format({"type": "status", "stage": "preprocess_done", "rgb_blocks": 0, "ir_blocks": 0})
+                num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
+                pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0).to(in_dtype)
+                yield sse_format({"type": "status", "stage": "preprocess_done", "rgb_blocks": int(num_patches_list[0]), "ir_blocks": int(num_patches_list[1])})
 
                 # 多 GPU：单卡时放到 cuda:0，多卡让 HF 处理
                 if torch.cuda.is_available():
@@ -641,7 +583,7 @@ def stream_chat(
                         multi_gpu = len(gpu_set) >= 2
                     else:
                         multi_gpu = torch.cuda.device_count() >= 2
-                    if not multi_gpu and pixel_values is not None:
+                    if not multi_gpu:
                         pixel_values = pixel_values.to(torch.device("cuda:0"), non_blocking=True)
             else:
                 # 纯文本回退路径
@@ -651,15 +593,8 @@ def stream_chat(
 
             # 问题构造（与 chat 一致）
             is_first_turn = not history
-            has_img1 = pixel_values1 is not None
-            has_img2 = pixel_values2 is not None
-            is_triple = bool(has_img1 and has_img2 and text)
             if is_first_turn:
-                if is_triple:
-                    question = build_initial_messages(prompt, text, extra_content=extra_content)
-                else:
-                    num_imgs = (1 if has_img1 else 0) + (1 if has_img2 else 0)
-                    question = build_minimal_question(text, extra_content=extra_content, num_images=num_imgs)
+                question = build_initial_messages(prompt, text, extra_content=extra_content)
             else:
                 question = (extra_content or "请继续").strip()
             yield sse_format({"type": "status", "stage": "question_ready", "first_turn": bool(is_first_turn)})
@@ -913,16 +848,14 @@ def _serialize_for_csv(value: Optional[str]) -> str:
 
 def _load_error_ids(path: str = "error.txt") -> set[str]:
     """
-    读取错误清单文件 error.txt，按空白分隔 dataset_id，返回字符串集合。
-    若文件不存在或格式异常，返回空集合。
+    读取 error.txt，按空白分隔 dataset_id，返回字符串集合；文件不存在或异常则返回空集。
     """
     try:
         if not os.path.exists(path):
             return set()
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-        ids = set(x for x in content.strip().split() if x)
-        return ids
+        return set(x for x in content.strip().split() if x)
     except Exception:
         return set()
 
@@ -1308,28 +1241,14 @@ async def analyze_consistency(
             raise HTTPException(status_code=400, detail="未找到会话缓存：请在首轮提供图像与文本后再继续对话。")
         rgb_path = os.path.join(sess_dir, "rgb.jpg")
         ir_path = os.path.join(sess_dir, "ir.jpg")
-        # 放宽：允许仅文本或仅一张图片继续对话
-        # 若两张图片都不存在且也没有文本，将在后续校验
+        if not (os.path.exists(rgb_path) and os.path.exists(ir_path)):
+            raise HTTPException(status_code=400, detail="会话缓存不完整：缺少图像，请重新发起首轮请求。")
         final_text = cached.get("text")
         label = cached.get("label")
         consistency_result_label = cached.get("consistency_result_label")
         history = incoming_history if incoming_history is not None else cached.get("history")
         if not isinstance(history, (list, type(None))):
             history = None
-
-    # 计算本轮是否满足三模态（两张图+文本）
-    has_img1 = bool(rgb_path and os.path.exists(rgb_path))
-    has_img2 = bool(ir_path and os.path.exists(ir_path))
-    has_text = bool(final_text)
-    is_triple_now = has_img1 and has_img2 and has_text
-
-    # 当首次出现三模态时，遗忘三模态之前的消息：将历史清空
-    if is_triple_now and history:
-        history = None
-
-    # 若完全没有可用输入，则报错
-    if not (has_img1 or has_img2 or has_text):
-        raise HTTPException(status_code=400, detail="本轮缺少可用输入：请提供至少一张图片或文本。")
 
     # 分支：SSE 流式 or 常规一次性
     if stream:
@@ -1359,18 +1278,10 @@ async def analyze_consistency(
             # 将新的历史写回缓存（由于 stream_chat 内部 history 追加是在模型侧完成，这里简单读回）
             with session_lock:
                 meta = _load_json(os.path.join(sess_dir, "meta.json")) or {}
-                # 当本轮满足三模态时，遗忘之前的历史
-                old_hist = [] if is_triple_now else (meta.get("history") or [])
+                # 保险起见，将最后一轮问答补充到历史
+                old_hist = meta.get("history") or []
                 is_first_turn_local = not old_hist
-                # 根据是否满足三模态，决定问题构造方式
-                if is_first_turn_local:
-                    if is_triple_now:
-                        q = build_initial_messages(prompt, final_text, extra_content=content)
-                    else:
-                        num_imgs = (1 if has_img1 else 0) + (1 if has_img2 else 0)
-                        q = build_minimal_question(final_text, extra_content=content, num_images=num_imgs)
-                else:
-                    q = (content or "请继续").strip()
+                q = build_initial_messages(prompt, final_text, extra_content=content) if is_first_turn_local else (content or "请继续").strip()
                 old_hist.append((q, model_response))
                 meta["history"] = old_hist
                 _save_json(os.path.join(sess_dir, "meta.json"), meta)
@@ -1428,9 +1339,7 @@ async def analyze_consistency(
         # 进行模型推理（一次性返回）
         try:
             print(f"开始推理 session:{session_id} ...")
-            # 非流式：当本轮出现三模态，清空历史再调用 chat
-            call_history = None if is_triple_now else history
-            chat_result = await run_in_threadpool(chat, rgb_path, ir_path, final_text, content, call_history, True)
+            chat_result = await run_in_threadpool(chat, rgb_path, ir_path, final_text, content, history, True)
             if isinstance(chat_result, tuple):
                 model_response, new_history = chat_result
             else:
@@ -1439,7 +1348,6 @@ async def analyze_consistency(
             # 将新的历史写回缓存
             with session_lock:
                 meta = _load_json(os.path.join(sess_dir, "meta.json")) or {}
-                # 当本轮出现三模态时，直接使用新历史（相当于重置）；否则沿用模型返回的历史
                 meta["history"] = new_history
                 _save_json(os.path.join(sess_dir, "meta.json"), meta)
 
@@ -1524,7 +1432,6 @@ async def analyze_consistency(
 async def run_batch_infer_project(project_id: int, body: BatchInferBody):
     print(f"[BATCH] 批量样本推理启动 project_id={project_id}, 样本数={len(body.datasets)}")
     per_item_results, errors = [], []
-    error_ids = _load_error_ids("error.txt")  # 若文件不存在则为空集
 
     async with httpx.AsyncClient(timeout=300.0) as client:  # 拉长总超时
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1587,14 +1494,10 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
                     # 计算准确率（基于 label 与预测）
                     sample_acc = 1.0 if (label in _VALID_REL and pred in _VALID_REL and pred == label) else 0.0
 
-                    # consistency 认知准确率：若存在 error.txt，则以其为准；否则按原有比较逻辑
-                    if error_ids:
-                        consistency_result_accuracy = 0.0 if dsid in error_ids else 1.0
+                    if consistency_result_label == overall_inference:
+                        consistency_result_accuracy=1.0
                     else:
-                        if consistency_result_label == overall_inference:
-                            consistency_result_accuracy = 1.0
-                        else:
-                            consistency_result_accuracy = 0.0
+                        consistency_result_accuracy=0.0
 
                     # 写入样本 CSV
                     update_row = UpdateDatasetBody(
@@ -1663,7 +1566,7 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
 
     # 1) 读取 CSV 缓存，命中的直接使用
     requested_ids = [str(it.dataset_id) for it in body.datasets]
-    error_ids = _load_error_ids("error.txt")  # 若不存在则为空集
+    error_ids = _load_error_ids("error.txt")  # 若文件不存在则为空集
     existing_map = _load_existing_update_rows(project_id, requested_ids)
     for key, update_data in existing_map.items():
         dataset_id = int(key)
@@ -1672,7 +1575,11 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 print(f"正在向 {callback_url} 发送回调...")
-                response = await client.put(callback_url, json=update_data.dict())
+                # 若存在 error.txt，则覆盖单条一致性认知准确率
+                payload = update_data.dict()
+                if 'error_ids' in locals() and error_ids:
+                    payload["consistency_result_accuracy"] = 0.0 if str(dataset_id) in error_ids else 1.0
+                response = await client.put(callback_url, json=payload)
                 resp_text = (response.text or "")
                 print(f"[CALLBACK][cached dataset {dataset_id}] status={response.status_code}, body={resp_text[:200]!r}")
                 response.raise_for_status()
@@ -1698,7 +1605,6 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
             missing_after_run.append(dsid)
             continue
         row = {"dataset_id": dsid, **b.dict()}
-        # 若存在 error.txt，则覆盖单条 consistency_result_accuracy 字段
         if error_ids:
             row["consistency_result_accuracy"] = 0.0 if dsid in error_ids else 1.0
         items.append(row)
@@ -1736,7 +1642,6 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
                 if pred == label:
                     cls_correct[label] += 1
             if error_ids:
-                # 有错误清单时，以其为准：不在列表即判定为正确
                 if dsid not in error_ids:
                     consistency_cognition_accuracy += 1
             else:
@@ -1749,9 +1654,10 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
     per_class_acc = {c: (cls_correct[c] / cls_total[c]) if cls_total[c] > 0 else None for c in _VALID_REL}
     valid_accs = [v for v in per_class_acc.values() if v is not None]
     infer_relation_accuracy = sum(valid_accs) / len(valid_accs) if valid_accs else 0.0
-    # 若有错误清单，项目级一致性认知准确率 = (总样本数 - 错误数)/总样本数
     if error_ids and len(requested_ids) > 0:
-        consistency_cognition_accuracy = (len(requested_ids) - len([i for i in requested_ids if i in error_ids])) / len(requested_ids)
+        # 项目级一致性认知准确率以 error.txt 为准
+        err_count = sum(1 for i in requested_ids if i in error_ids)
+        consistency_cognition_accuracy = (len(requested_ids) - err_count) / len(requested_ids)
     else:
         consistency_cognition_accuracy = consistency_cognition_accuracy / len(body.datasets) if body.datasets else 0.0
 
