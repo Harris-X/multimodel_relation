@@ -250,12 +250,14 @@ prompt = ("""
 2.  **配对分析**: 判断三组配对（图像1-图像2、图像1-文本1、图像2-文本1）的关系，必须从以下四种类型中选择：
       * **等价**: 核心事实、主体和事件完全相同。
       * **关联**: 核心事件相关，但在范围、细节或视角上存在差异。
-      * **因果**: 一方是原因（如行动），另一方是结果（如状态），或者反过来。比如，由于敌方森林基地被袭击，所以派出士兵在森林巡逻，是因果关系；由于导弹袭击了坦克，坦克爆炸，是因果关系。
+      * **因果**: 一方是原因（如行动），另一方是结果（如状态），或者反过来。
       * **矛盾**: 核心事实存在直接冲突（如数量、行为、状态）。
 3.  **总体判定**: 综合配对分析结果，给出【图像1-图像2-文本1】的总体关系。判定遵循**最高优先级原则：因果> 矛盾 > 关联 > 等价**。 
         **注意**：1.若在关系判定的分析中一对关系出现了因果/矛盾关系，则可以直接据此判定总体关系为因果/矛盾关系。
         2.注意区分图像中坦克是充气坦克（坦克模型）还是真实坦克，如果文本中出现对坦克功能的描述，图像一般是充气坦克，充气坦克没有文本描述的功能，而此关系则会出现矛盾。
-        **案例**: 图像显示敌方士兵在活动，而文本表明没有发现敌方活动，则图像-文本关系为矛盾，且总体关系为矛盾；图像显示敌方坦克在行驶，而文本表明敌方坦克被导弹击中爆炸，则图像-文本关系为因果，且总体关系为因果。
+        **案例**: 
+                1. 矛盾关系 图像显示敌方士兵在活动，而文本表明没有发现敌方活动，则图像-文本关系为矛盾，且总体关系为矛盾；图像显示敌方坦克在行驶，而文本表明敌方坦克被导弹击中爆炸，则图像-文本关系为因果，且总体关系为因果。
+                2. 因果关系 由于敌方森林基地被袭击，所以派出士兵在森林巡逻，是因果关系；由于导弹袭击了坦克，坦克爆炸，是因果关系。
 
 # 分析准则
   - **内容优先**: 忽略模态差异（如RGB与红外成像），只关注语义内容。假定两张图片描述的是同一场景。红外图像中的红黄色代表热量，不代表着火。
@@ -420,7 +422,7 @@ def chat(
     img_input_size = int(os.environ.get("IMG_INPUT_SIZE", "448"))
     rgb_max_blocks = int(os.environ.get("RGB_MAX_BLOCKS", "8"))
     ir_max_blocks = int(os.environ.get("IR_MAX_BLOCKS", "6"))
-    max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "512"))
+    max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "1024"))
 
     # 首次尝试
     try:
@@ -455,7 +457,7 @@ def chat(
             else:
                 question = (extra_content or "请继续").strip()
             generation_config = dict(
-                max_new_tokens=int(max(64, reduced_tokens // 2)),
+                max_new_tokens=int(max(128, reduced_tokens // 2)),
                 do_sample=False,
                 temperature=0.6,
                 repetition_penalty=1.05,
@@ -530,7 +532,7 @@ def stream_chat(
     img_input_size = int(os.environ.get("IMG_INPUT_SIZE", "448"))
     rgb_max_blocks = int(os.environ.get("RGB_MAX_BLOCKS", "8"))
     ir_max_blocks = int(os.environ.get("IR_MAX_BLOCKS", "6"))
-    max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "512"))
+    max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "1024"))
 
     # 预留张量句柄用于清理
     pixel_values = None
