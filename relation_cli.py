@@ -132,11 +132,11 @@ def execute(mode: str, rgb_image_url: str, infrared_image_url: str, text_json_ur
         final_relation, consistency_result = parse_relations_and_consistency(output_text)
         is_conflict = (final_relation == "矛盾")
         if mode == "conflict":
-            return {"conflict": bool(is_conflict), "final_relation": final_relation}
+            return {"conflict": bool(is_conflict)} # , "final_relation": final_relation
         if mode == "relation":
             return {"final_relation": final_relation}
         if mode == "full":
-            return {"final_relation": final_relation, "consistency_result": consistency_result, "is_conflict": bool(is_conflict)}
+            return {"is_conflict": bool(is_conflict), "consistency_result": consistency_result} # "final_relation": final_relation,
         raise ValueError(f"未知 mode: {mode}")
 
 # ------------- CLI -------------
