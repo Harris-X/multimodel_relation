@@ -90,11 +90,28 @@ def run_infer(
 def parse_relations_and_consistency(model_output: str):
     parsed = svc.check_label_re(model_output)
     overall_inference = svc.extract_overall_inference(model_output)
-    rels = {tuple(sorted(r["entities"])): r["type"] for r in parsed.get("relationships", [])}
-    final_key = tuple(sorted(["图片1", "图片2", "文本1"]))
-    pred_raw = rels.get(final_key)
-    final_relation = svc.normalize_relation_name(pred_raw)
-    return final_relation, overall_inference
+
+    rels = parsed.get("relationships", [])
+    normalized_pairs: dict[str, str] = {}
+
+    def normalize_entity(name: str) -> str:
+        return name.replace("图片", "图像").strip()
+
+    final_relation = None
+    final_key = tuple(sorted([normalize_entity(n) for n in ("图像1", "图像2", "文本1")]))
+
+    for entry in rels:
+        entities = entry.get("entities") or []
+        norm_entities = [normalize_entity(e) for e in entities]
+        raw_type = entry.get("type")
+        normalized = svc.normalize_relation_name(raw_type)
+        if len(norm_entities) == 3 and tuple(sorted(norm_entities)) == final_key:
+            final_relation = normalized
+        elif len(norm_entities) == 2:
+            key = "-".join(sorted(norm_entities))
+            normalized_pairs[key] = normalized or raw_type
+
+    return final_relation, overall_inference, normalized_pairs
 
 
 # ------------- 图像获取（支持 URL） -------------
@@ -128,16 +145,24 @@ def execute_mode(
         if not main_text:
             raise ValueError("文本 JSON 缺少有效 'text' 字段")
         output_text = run_infer(rgb_path, ir_path, main_text)
-        final_relation, consistency_result = parse_relations_and_consistency(output_text)
+        final_relation, consistency_result, pair_relations = parse_relations_and_consistency(output_text)
         is_conflict = final_relation == "矛盾"
         if mode == "conflict":
-            return {"conflict": bool(is_conflict), "final_relation": final_relation}
+            return {
+                "conflict": bool(is_conflict),
+                "final_relation": final_relation,
+                "pair_relations": pair_relations,
+            }
         if mode == "relation":
-            return {"final_relation": final_relation}
+            return {
+                "final_relation": final_relation,
+                "pair_relations": pair_relations,
+            }
         if mode == "full":
             return {
                 "final_relation": final_relation,
                 "consistency_result": consistency_result,
                 "is_conflict": bool(is_conflict),
+                "pair_relations": pair_relations,
             }
         raise ValueError(f"未知 mode: {mode}")

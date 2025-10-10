@@ -37,12 +37,20 @@ def main(argv=None):
         sys.exit(1)
 
     final_relation = result.get("final_relation") or "未解析"
+    pair_rel = result.get("pair_relations") or {}
+
+    def pair_value(key: str) -> str:
+        value = pair_rel.get(key)
+        return value or "未解析"
 
     summary_lines = [
         "【任务】==== 推演关系 (relation)",
         f"【RGB 图像】==== {args.rgb_image_url}",
         f"【红外图像】==== {args.infrared_image_url}",
         f"【文本 JSON】==== {args.text_json_url}",
+        f"【图像1-图像2 关系】==== {pair_value('图像1-图像2')}",
+        f"【图像1-文本1 关系】==== {pair_value('图像1-文本1')}",
+        f"【图像2-文本1 关系】==== {pair_value('图像2-文本1')}",
         f"【总体关系】==== {final_relation}",
     ]
 
