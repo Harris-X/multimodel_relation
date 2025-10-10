@@ -14,7 +14,7 @@ import base64
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, Form, HTTPException, File, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse,Response
 from pydantic import BaseModel
 from enum import Enum
 from typing import Optional
