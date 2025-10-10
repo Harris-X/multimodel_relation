@@ -92,6 +92,7 @@ def parse_relations_and_consistency(model_output: str):
     overall_inference = svc.extract_overall_inference(model_output)
 
     rels = parsed.get("relationships", [])
+    pair_relations: dict[str, str] = {}
     normalized_pairs: dict[str, str] = {}
 
     def normalize_entity(name: str) -> str:
@@ -109,6 +110,7 @@ def parse_relations_and_consistency(model_output: str):
             final_relation = normalized
         elif len(norm_entities) == 2:
             key = "-".join(sorted(norm_entities))
+            pair_relations[key] = raw_type
             normalized_pairs[key] = normalized or raw_type
 
     return final_relation, overall_inference, normalized_pairs

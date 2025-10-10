@@ -3,7 +3,7 @@
 """
 relation_cli_full.py
 
-命令行工具：输出总体关系 + 一致性结论 + 是否矛盾。
+命令行工具：输出总体关系 + 三对模态关系 + 一致性结论 + 是否矛盾。
 """
 from __future__ import annotations
 
@@ -50,14 +50,23 @@ def main(argv=None):
     final_relation = result.get("final_relation") or "未解析"
     consistency_result = result.get("consistency_result") or "未提取"
     conflict_flag = "是" if result.get("is_conflict") else "否"
+    pair_rel = result.get("pair_relations") or {}
+
+    def pair_value(key: str) -> str:
+        value = pair_rel.get(key)
+        return value or "未解析"
 
     summary_lines = [
-        "【任务】==== 一致性认知判断",
+        "【任务】==== 全量输出 (full)",
         f"【RGB 图像】==== {rgb_url}",
         f"【红外图像】==== {infrared_url}",
         f"【文本 JSON】==== {text_url}",
-        f"【是否冲突】==== {conflict_flag}",
+        f"【图像1-图像2 关系】==== {pair_value('图像1-图像2')}",
+        f"【图像1-文本1 关系】==== {pair_value('图像1-文本1')}",
+        f"【图像2-文本1 关系】==== {pair_value('图像2-文本1')}",
+        f"【总体关系】==== {final_relation}",
         f"【一致性结论】==== {consistency_result}",
+        f"【是否矛盾】==== {conflict_flag}",
     ]
 
     output = "\n".join(summary_lines)

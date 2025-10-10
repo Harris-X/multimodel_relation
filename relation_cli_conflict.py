@@ -15,21 +15,32 @@ from relation_cli_common import execute_mode
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="多模态关系分析 CLI - 冲突判定模式")
-    p.add_argument("--rgb_image_url", required=True, help="RGB 图像本地路径或 URL")
-    p.add_argument("--infrared_image_url", required=True, help="红外图像本地路径或 URL")
-    p.add_argument("--text_json_url", required=True, help="文本 JSON 路径或 URL (需包含 text 字段)")
+    p.add_argument("--rgb_image_url", required=False, help="RGB 图像本地路径或 URL")
+    p.add_argument("--infrared_image_url", required=False, help="红外图像本地路径或 URL")
+    p.add_argument("--text_json_url", required=False, help="文本 JSON 路径或 URL (需包含 text 字段)")
+    p.add_argument("rgb_image_url_pos", nargs="?", help="RGB 图像路径 (位置参数)")
+    p.add_argument("infrared_image_url_pos", nargs="?", help="红外图像路径 (位置参数)")
+    p.add_argument("text_json_url_pos", nargs="?", help="文本 JSON 路径 (位置参数)")
     p.add_argument("--pretty", action="store_true", help="添加分隔符突出显示结果")
     return p
 
 def main(argv=None):
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    rgb_url = args.rgb_image_url or args.rgb_image_url_pos
+    infrared_url = args.infrared_image_url or args.infrared_image_url_pos
+    text_url = args.text_json_url or args.text_json_url_pos
+
+    if not (rgb_url and infrared_url and text_url):
+        parser.error("必须提供 RGB、红外与文本路径，可使用位置或命名参数")
+
     try:
         result = execute_mode(
             "conflict",
-            rgb_image_url=args.rgb_image_url,
-            infrared_image_url=args.infrared_image_url,
-            text_json_url=args.text_json_url,
+            rgb_image_url=rgb_url,
+            infrared_image_url=infrared_url,
+            text_json_url=text_url,
         )
     except Exception as e:  # noqa: BLE001
         print(f"【错误】==== {e}", file=sys.stderr)
@@ -45,9 +56,9 @@ def main(argv=None):
 
     summary_lines = [
         "【任务】==== 冲突判定 (conflict)",
-        f"【RGB 图像】==== {args.rgb_image_url}",
-        f"【红外图像】==== {args.infrared_image_url}",
-        f"【文本 JSON】==== {args.text_json_url}",
+        f"【RGB 图像】==== {rgb_url}",
+        f"【红外图像】==== {infrared_url}",
+        f"【文本 JSON】==== {text_url}",
         f"【图像1-图像2 关系】==== {pair_value('图像1-图像2')}",
         f"【图像1-文本1 关系】==== {pair_value('图像1-文本1')}",
         f"【图像2-文本1 关系】==== {pair_value('图像2-文本1')}",
