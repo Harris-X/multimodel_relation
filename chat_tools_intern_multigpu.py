@@ -10,6 +10,7 @@ import csv
 import asyncio
 import httpx
 import uvicorn
+import base64
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, Form, HTTPException, File, Request
 from fastapi.concurrency import run_in_threadpool
@@ -17,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from enum import Enum
 from typing import Optional
+from io import BytesIO
 import tempfile
 import uuid
 import torchvision.transforms as T
@@ -151,10 +153,10 @@ def load_model():
         max_memory=max_memory         # 关键：限制每卡占用
     ).eval()
     # 打印分片结果，便于确认使用了哪些 GPU
-    try:
-        print("hf_device_map:", getattr(model, "hf_device_map", None))
-    except Exception:
-        pass
+    # try:
+    #     print("hf_device_map:", getattr(model, "hf_device_map", None))
+    # except Exception:
+    #     pass
     # 注意：不要再调用 model.cuda()，否则会把模型挪到单卡
     print("模型加载完成（多GPU）")
     return tokenizer, model, dtype
@@ -1779,6 +1781,80 @@ async def stream_with_session(session_id: str, content: str):
         "X-Accel-Buffering": "no",
     }
     return StreamingResponse(_gen(), media_type="text/event-stream; charset=utf-8", headers=headers)
+
+# ==============================================================================
+# 6. 图生文以及图生图
+# ==============================================================================
+def load_image_from_base64(base64_str: str, input_size=448, max_num=12) -> torch.Tensor:
+    if 'base64,' in base64_str:
+        base64_str = base64_str.split('base64,')[-1]
+
+    image_bytes = base64.b64decode(base64_str)
+    image = Image.open(BytesIO(image_bytes)).convert('RGB')
+    transform = build_transform(input_size=input_size)
+    images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+    pixel_values = [transform(img) for img in images]
+    pixel_values = torch.stack(pixel_values)
+    pixel_values = pixel_values.to(torch.bfloat16)
+    
+    return pixel_values
+
+def chat4text(img_base64, is_consistency):
+    tokenizer = model_globals["tokenizer"]
+    model = model_globals["model"]
+    generation_config = dict(max_new_tokens=1024, do_sample=True)
+    pixel_values = load_image_from_base64(img_base64)   
+    
+    question = ""
+    if is_consistency:
+        question = '<image>\n你是一名战场分析官，我将提供敌军的情报照片，请描述这张图片，40个字以内.'
+    else:
+        question = '<image>\n你是一名战场分析官，我将提供敌军的情报照片，生成和这张图片完全矛盾或者相反的描述，40个字以内.'
+    response = model.chat(tokenizer, pixel_values, question, generation_config)
+    
+    return response
+
+@app.post(
+    "/v1/consistency/generate/text",
+    summary="[生成] 图生文"
+)
+async def img_generate_text(img_base64: str = Form(...), is_consistency: bool = Form(...)):
+    return {"text": chat4text(img_base64, is_consistency)}
+
+
+@app.api_route("/v1/consistency/generate/text", methods=["POST"], summary="[生成] 图生图")
+async def img_generate_img(request: Request):
+    TARGET_SERVER = "http://117.50.217.225:8000"
+    path = "generate/img"
+    target_url = f"{TARGET_SERVER}/{path}"
+    method = request.method
+    headers = dict(request.headers)
+    params = dict(request.query_params)
+    
+    headers.pop("host", None)  # 可选：移除原Host，使用目标服务器的Host
+    body = await request.body()
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.request(
+                method=method,
+                url=target_url,
+                headers=headers,
+                params=params,
+                content=body,  # 二进制body，支持所有类型（JSON、表单、文件等）
+                timeout=60.0  # 超时时间（秒）
+            )
+        except httpx.TimeoutException:
+            return Response(content="转发超时", status_code=504)
+        except Exception as e:
+            return Response(content=f"转发失败: {str(e)}", status_code=500)
+    
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=dict(response.headers),
+        media_type=response.media_type
+    )
 
 if __name__ == "__main__":
     # 确保启动的是本文件的多卡应用
