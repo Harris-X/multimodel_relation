@@ -185,8 +185,9 @@ class UpdateDatasetBody(BaseModel):
     final_relation: str # 最终关系 # 缺乏一个labal
     actual_relation: str  # 新增：标准答案标签
     accuracy: float # 检测准确率 1/0 比对 label 标签
-    consistency_result: str # 一致性认知结果, 手动创建
-    consistency_result_accuracy: float # 一致性认知结果准确率, 手动创建
+    consistency_result: str # 一致性认知结果, 手动创建 TODO 一致 冲突（有无） 歧义（真假坦克）
+    consistency_result_accuracy: float # 一致性认知结果准确率, 手动创建 TODO  一致性认知检测准确率
+    consistency_relation: str # 新增：一致性关系分类，一致/冲突/歧义
     raw_model_output: Optional[str] = None  # 新增：模型原始输出（可选）
 
 class ProjectStatusEnum(str, Enum):
@@ -224,6 +225,22 @@ _REL_SYNONYMS = {
     "因果关系": "因果"
 }
 _VALID_REL = {"等价", "关联", "因果", "矛盾"}
+
+# 一致性关系分类工具
+def classify_consistency_relation(final_relation: str, overall_inference: str) -> str:
+    """
+    final_relation: 等价/关联/因果/矛盾
+    overall_inference: 综合事实推断文本
+    返回: 一致/冲突/歧义
+    """
+    if final_relation in ("等价", "关联", "因果"):
+        return "一致"
+    if final_relation == "矛盾":
+        # 若综合事实推断中包含“充气模型”或“充气坦克”则为歧义
+        if overall_inference and ("充气模型" in overall_inference or "充气" in overall_inference):
+            return "歧义"
+        return "冲突"
+    return "未知"
 
 def normalize_relation_name(name: str) -> Optional[str]:
     if not name:
@@ -268,7 +285,6 @@ prompt = ("""
   - **论证严谨**: 结论必须明确，禁止使用“可能”、“似乎”等模糊词汇。论证需引用数量、行为等具体细节支撑。
 
 # 输出格式
-严格按照以下格式输出。
 
 **【标准格式】(无矛盾时)**
 
@@ -280,12 +296,12 @@ prompt = ("""
           
 分析过程:
 1. 信息描述:
-   - 图像1内容:[图像1的简洁描述]
-   - 图像2内容:[图像2的简洁描述]
-   - 文本1内容:[文本1的核心内容概括]
+    - 图像1内容:[图像1的简洁描述]
+    - 图像2内容:[图像2的简洁描述]
+    - 文本1内容:[文本1的核心内容概括]
 2. 关系论证:
-   - [对三组配对关系和总体关系的详细分析和论证]
-   - [分析中出现原因、结果，或者可能原因、可能结果的，直接判定为因果关系，不需要特别直接、明确的因果关系]
+    - [对三组配对关系和总体关系的详细分析和论证]
+    - [分析中出现原因、结果，或者可能原因、可能结果的，直接判定为因果关系，不需要特别直接、明确的因果关系]
 
 **【特殊格式】(存在矛盾时)**
 
@@ -299,11 +315,11 @@ prompt = ("""
 
 分析过程:
 1. 信息描述:
-   - 图像1内容:[图像1的简洁描述]
-   - 图像2内容:[图像2的简洁描述]
-   - 文本1内容:[文本1的核心内容概括]
+    - 图像1内容:[图像1的简洁描述]
+    - 图像2内容:[图像2的简洁描述]
+    - 文本1内容:[文本1的核心内容概括]
 2. 关系论证:
-   - [简洁分析为何存在矛盾,并论证为何某两者最相关,以及为何某个模态信息相斥]
+    - [简洁分析为何存在矛盾,并论证为何某两者最相关,以及为何某个模态信息相斥]
 """
 )
 
@@ -796,6 +812,21 @@ def extract_overall_inference(text: str) -> Optional[str]:
         # 截断到该行结束（去掉后续可能的附加说明）
         return m.group(1).strip()
     return None
+
+
+# 新增: 提取“综合事实推断”内容
+def extract_consistency_inference(text: str) -> Optional[str]:
+    """
+    从模型输出中抽取 '一致性关系:' 后的单行内容。
+    若未找到返回 None。
+    """
+    # 允许前面有全角/半角冒号
+    m = re.search(r'一致性关系[:：]\s*(.+)', text)
+    if m:
+        # 截断到该行结束（去掉后续可能的附加说明）
+        return m.group(1).strip()
+    return None
+
 
 # ==============================================================================
 # 4. API 端点定义
@@ -1311,6 +1342,7 @@ async def analyze_consistency(
                 consistency_result_accuracy = 1.0 if consistency_result_label == overall_inference else 0.0
                 accuracy = 1.0 if (pred == label and label is not None) else 0.0
 
+                consistency_relation = classify_consistency_relation(rels.get(final_key, "未知"), overall_inference)
                 update_data_local = UpdateDatasetBody(
                     rgb_infrared_relation=rels.get(rgb_ir_key, "未知"),
                     text_infrared_relation=rels.get(text_ir_key, "未知"),
@@ -1320,6 +1352,7 @@ async def analyze_consistency(
                     accuracy=accuracy,
                     consistency_result=consistency_result_value or "None",
                     consistency_result_accuracy=consistency_result_accuracy,
+                    consistency_relation=consistency_relation,
                     raw_model_output=model_response
                 )
             except Exception as e:
@@ -1386,6 +1419,7 @@ async def analyze_consistency(
             else:
                 accuracy = 0.0
 
+            consistency_relation = classify_consistency_relation(rels.get(final_key, "未知"), overall_inference)
             update_data = UpdateDatasetBody(
                 rgb_infrared_relation=rels.get(rgb_ir_key, "未知"),
                 text_infrared_relation=rels.get(text_ir_key, "未知"),
@@ -1395,6 +1429,7 @@ async def analyze_consistency(
                 accuracy=accuracy,
                 consistency_result=consistency_result_value or "None",
                 consistency_result_accuracy=consistency_result_accuracy,
+                consistency_relation=consistency_relation,
                 raw_model_output=model_response  # 新增：持久化模型原始输出
             )
         except HTTPException:
@@ -1508,15 +1543,17 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
                         consistency_result_accuracy=0.0
 
                     # 写入样本 CSV
+                    consistency_relation = classify_consistency_relation(pred or (pred_raw or "未知"), overall_inference)
                     update_row = UpdateDatasetBody(
                         rgb_infrared_relation=rels.get(tuple(sorted(['图片1', '图片2'])), "未知"),
-                        text_infrared_relation=rels.get(tuple(sorted(['文本1', '图片2'])), "未知"),
+                        text_infrared_relation=rels.get(tuple(sorted(['图片1', '图片2'])), "未知"),
                         rgb_text_relation=rels.get(tuple(sorted(['图片1', '文本1'])), "未知"),
                         final_relation=pred or (pred_raw or "未知"),
                         actual_relation=label or (label_raw or "未知"),  # 新增：标准答案标签
                         accuracy=sample_acc,
                         consistency_result=overall_inference or "None",
                         consistency_result_accuracy=consistency_result_accuracy,
+                        consistency_relation=consistency_relation,
                         raw_model_output=model_output  # 新增：持久化模型原始输出
                     )
                     header = ["project_id", "dataset_id"] + list(UpdateDatasetBody.__annotations__.keys())
