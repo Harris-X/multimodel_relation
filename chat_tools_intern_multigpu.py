@@ -966,28 +966,21 @@ def _load_existing_update_rows(project_id: int, dataset_ids: list[str]) -> dict[
                     dsid = row.get("dataset_id")
                     if dsid not in wanted:
                         continue
-                    # 构建 UpdateDatasetBody（兼容缺失字段，逐行容错）
-                    try:
-                        body = UpdateDatasetBody(
-                            rgb_infrared_relation=row.get("rgb_infrared_relation", "未知"),
-                            text_infrared_relation=row.get("text_infrared_relation", "未知"),
-                            rgb_text_relation=row.get("rgb_text_relation", "未知"),
-                            final_relation=row.get("final_relation", "未知"),
-                            actual_relation=row.get("actual_relation", "未知"),
-                            accuracy=float(row.get("accuracy", 0) or 0),
-                            consistency_result=row.get("consistency_result", "None"),
-                            consistency_result_accuracy=float(row.get("consistency_result_accuracy", 0) or 0),
-                            consistency_relation=row.get("consistency_relation", "未知"),
-                            raw_model_output=row.get("raw_model_output")
-                        )
-                        result[dsid] = body
-                    except Exception as e:
-                        # 跳过坏行，避免整表缓存失效
-                        print(f"[CACHE][WARN] 读取缓存行失败 dataset_id={dsid}: {e}")
-                        continue
-        except Exception as e:
-            # 文件整体读取异常则视为无缓存
-            print(f"[CACHE][WARN] 读取CSV失败: {e}")
+                    # 构建 UpdateDatasetBody
+                    body = UpdateDatasetBody(
+                        rgb_infrared_relation=row.get("rgb_infrared_relation", "未知"),
+                        text_infrared_relation=row.get("text_infrared_relation", "未知"),
+                        rgb_text_relation=row.get("rgb_text_relation", "未知"),
+                        final_relation=row.get("final_relation", "未知"),
+                        actual_relation=row.get("actual_relation", "未知"),
+                        accuracy=row.get("accuracy", 0),
+                        consistency_result=row.get("consistency_result", "None"),
+                        consistency_result_accuracy=row.get("consistency_result_accuracy", 0),
+                        raw_model_output=row.get("raw_model_output")
+                    )
+                    result[dsid] = body
+        except Exception:
+            # 读取异常则视为无缓存
             return {}
     return result
 
@@ -1483,33 +1476,9 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
     print(f"[BATCH] 批量样本推理启动 project_id={project_id}, 样本数={len(body.datasets)}")
     per_item_results, errors = [], []
 
-    # 缓存命中直接跳过推理，仅回调
-    requested_ids = [str(it.dataset_id) for it in body.datasets]
-    error_ids = _load_error_ids("error.txt")
-    existing_map = _load_existing_update_rows(project_id, requested_ids)
-    if existing_map:
-        for key, update_data in existing_map.items():
-            dataset_id = int(key)
-            callback_url = f"{base_url}/v1/consistency/infer/{project_id}/{dataset_id}"
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as client_cb:
-                    payload = update_data.dict()
-                    if error_ids:
-                        payload["consistency_result_accuracy"] = 0.0 if str(dataset_id) in error_ids else 1.0
-                    else:
-                        payload["consistency_result_accuracy"] = 1.0
-                    print(f"[BATCH] 已缓存 dataset_id={dataset_id}，直接回调并跳过推理")
-                    resp = await client_cb.put(callback_url, json=payload)
-                    resp.raise_for_status()
-            except Exception as e:
-                print(f"[BATCH][WARN] 缓存样本回调失败 dataset_id={dataset_id}: {e}")
-
-    # 仅对未命中的执行推理
-    pending_items = [it for it in body.datasets if str(it.dataset_id) not in existing_map]
-
     async with httpx.AsyncClient(timeout=300.0) as client:  # 拉长总超时
         with tempfile.TemporaryDirectory() as temp_dir:
-            for item in pending_items:
+            for item in body.datasets:
                 dsid = str(item.dataset_id)
                 try:
                     print(f"[BATCH] 开始处理 dataset_id={dsid}")
@@ -1573,17 +1542,11 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
                     else:
                         consistency_result_accuracy=0.0
 
-                    error_ids = _load_error_ids("error.txt")  # 若文件不存在则为空集
-                    if 'error_ids' in locals() and error_ids and dsid in error_ids:
-                        consistency_result_accuracy = 0.0
-                    else:
-                        consistency_result_accuracy = 1.0
-
                     # 写入样本 CSV
                     consistency_relation = classify_consistency_relation(pred or (pred_raw or "未知"), overall_inference)
                     update_row = UpdateDatasetBody(
                         rgb_infrared_relation=rels.get(tuple(sorted(['图片1', '图片2'])), "未知"),
-                        text_infrared_relation=rels.get(tuple(sorted(['文本1', '图片2'])), "未知"),
+                        text_infrared_relation=rels.get(tuple(sorted(['图片1', '图片2'])), "未知"),
                         rgb_text_relation=rels.get(tuple(sorted(['图片1', '文本1'])), "未知"),
                         final_relation=pred or (pred_raw or "未知"),
                         actual_relation=label or (label_raw or "未知"),  # 新增：标准答案标签
