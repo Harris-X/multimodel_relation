@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 找到 Conda 的基础安装路径并初始化
+# 下面这行代码会找到你的 conda 安装位置，例如 /root/miniconda3
+__conda_setup="$('/root/miniconda3/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    eval "$__conda_setup"
+else
+    if [ -f "/root/miniconda3/etc/profile.d/conda.sh" ]; then
+        . "/root/miniconda3/etc/profile.d/conda.sh"
+    else
+        export PATH="/root/miniconda3/bin:$PATH"
+    fi
+fi
+unset __conda_setup
+
+# 现在可以正常激活环境了
+conda activate mr
+
+
 # 避免 numexpr 线程数告警
 export NUMEXPR_MAX_THREADS=${NUMEXPR_MAX_THREADS:-512}
 

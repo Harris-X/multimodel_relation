@@ -18,12 +18,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--rgb_image_url", required=False, help="RGB 图像本地路径或 URL")
     p.add_argument("--infrared_image_url", required=False, help="红外图像本地路径或 URL")
     p.add_argument("--text_json_url", required=False, help="文本 JSON 路径或 URL (需包含 text 字段)")
-    p.add_argument("--label", required=False, help="对应的label")
     p.add_argument("rgb_image_url_pos", nargs="?", help="RGB 图像路径 (位置参数)")
     p.add_argument("infrared_image_url_pos", nargs="?", help="红外图像路径 (位置参数)")
     p.add_argument("text_json_url_pos", nargs="?", help="文本 JSON 路径 (位置参数)")
-    p.add_argument("label_pos", nargs="?", help="标签的 JSON 文件路径")
-    p.add_argument("--pretty", default=True, action="store_true", help="添加分隔符突出显示结果")
+    # p.add_argument("--label", required=False, help="对应的label")
+    # p.add_argument("label_pos", nargs="?", help="标签的 JSON 文件路径")
+    # p.add_argument("--pretty", default=True, action="store_true", help="添加分隔符突出显示结果")
     return p
 
 def main(argv=None):
@@ -33,13 +33,14 @@ def main(argv=None):
     rgb_url = args.rgb_image_url or args.rgb_image_url_pos
     infrared_url = args.infrared_image_url or args.infrared_image_url_pos
     text_url = args.text_json_url or args.text_json_url_pos
-    label = args.label or args.label_pos
-    with open(label, 'r') as file:
-        label_json = json.load(file)
-    rgb1_rgb2 = label_json.get("conflict_label_rgb1_rgb2")
-    rgb1_text1 = label_json.get("conflict_label_rgb1_text1")
-    rgb2_text1 = label_json.get("conflict_label_rgb2_text1")
-    final = label_json.get("conflict_final_conflict")
+
+    # label = args.label or args.label_pos
+    # with open(label, 'r') as file:
+    #     label_json = json.load(file)
+    # rgb1_rgb2 = label_json.get("conflict_label_rgb1_rgb2")
+    # rgb1_text1 = label_json.get("conflict_label_rgb1_text1")
+    # rgb2_text1 = label_json.get("conflict_label_rgb2_text1")
+    # final = label_json.get("conflict_final_conflict")
 
 
 
@@ -76,15 +77,15 @@ def main(argv=None):
         f"【图像1-文本1 是否冲突】==== {pair_conflict_label('图像1-文本1')}",
         f"【图像2-文本1 是否冲突】==== {pair_conflict_label('图像2-文本1')}",
         f"【总体是否矛盾】==== {conflict_flag}",
-        f"-----------------标签------------------",
-        f"【标签 图像1-图像2 是否冲突】==== {rgb1_rgb2}",
-        f"【标签 图像1-文本1 是否冲突】==== {rgb1_text1}",
-        f"【标签 图像2-文本1 是否冲突】==== {rgb2_text1}",
-        f"【标签 总体是否矛盾】==== {final}",
+        # f"-----------------标签------------------",
+        # f"【标签 图像1-图像2 是否冲突】==== {rgb1_rgb2}",
+        # f"【标签 图像1-文本1 是否冲突】==== {rgb1_text1}",
+        # f"【标签 图像2-文本1 是否冲突】==== {rgb2_text1}",
+        # f"【标签 总体是否矛盾】==== {final}",
     ]
 
     output = "\n".join(summary_lines)
-    if args.pretty:
+    if True:
         border = "=" * 48
         output = f"{border}\n{output}\n{border}"
 
