@@ -25,17 +25,21 @@ import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
 from threading import RLock, Thread
 from urllib.parse import urlparse
+from dotenv import load_dotenv
+
+# 在所有操作之前加载 .env 文件
+load_dotenv()
 
 # ==============================================================================
 # 1. 服务与模型配置
 # ==============================================================================
-# 回调基础地址：支持通过环境变量 CALLBACK_BASE_URL 覆盖，默认使用当前硬编码地址
+# 回调基础地址：支持通过环境变量 CALLBACK_BASE_URL 覆盖
 base_url = os.environ.get("CALLBACK_BASE_URL", "http://121.48.162.151:18000").rstrip('/')
-# 从环境变量读取配置（不要在代码里强行覆盖 CUDA_VISIBLE_DEVICES）
+# 从环境变量读取配置 (不要在代码里强行覆盖 CUDA_VISIBLE_DEVICES)
 # 可在启动前导出:  export CUDA_VISIBLE_DEVICES=0,1,2
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4"  # <- 删除这类硬编码
-# 修改模型路径
-MODEL_PATH = r"/root/autodl-tmp/multimodel_relation/downloaded_model/InternVL3_5-14B"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4"  # <- [已删除] 遵照 guideline.md 建议，移除硬编码
+# 修改模型路径 -> 改为从环境变量读取
+MODEL_PATH = os.environ.get("MODEL_PATH", r"/root/autodl-tmp/multimodel_relation/downloaded_model/InternVL3_5-14B")
 # 全局变量,用于在服务启动时加载并持有模型
 model_globals = {
     "tokenizer": None,
@@ -130,7 +134,7 @@ def load_model():
 
     # 多卡配置：device_map 与 max_memory
     device_map = os.environ.get("HF_DEVICE_MAP", "balanced")  # 默认均衡分片；可设为 auto / balanced_low_0
-    # 每卡可用显存比例，默认 0.9，可通过 GPU_MEM_FRACTION=0.85 覆盖
+    # 每卡可用显存比例，默认 1.0，可通过 GPU_MEM_FRACTION=0.85 覆盖
     mem_fraction = float(os.environ.get("GPU_MEM_FRACTION", "1.0"))
     max_memory = None
     if torch.cuda.is_available():
@@ -172,7 +176,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多模态关系分析算法服务",
-    description="集成GLM-4V模型,提供图像与文本关系分析,并根据文档回调指定接口。",
+    description="集成InternVL3_5-14B模型,提供图像与文本关系分析,并根据文档回调指定接口。",
     version="1.1.0",
     lifespan=lifespan
 )
@@ -196,6 +200,7 @@ class ProjectStatusEnum(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
+
 class UpdateProjectBody(BaseModel):
     status: ProjectStatusEnum
     infer_relation_accuracy: float # 总体推演关系准确率
@@ -205,6 +210,7 @@ class UpdateProjectBody(BaseModel):
     conflict_relationship_accuracy: Optional[float] # 矛盾关系准确率
     causation_relationship_accuracy: Optional[float] # 因果关系准确率
     relation_accuracy: Optional[float] # 关联关系准确率
+    temporal_relationship_accuracy: Optional[float] # 新增：顺承关系准确率
 
 # ---------------- 新增：批量请求体定义 ----------------
 class DatasetItem(BaseModel):
@@ -222,9 +228,10 @@ _REL_SYNONYMS = {
     "相同": "等价", "一致": "等价", "相符": "等价",
     "相关": "关联", "联系": "关联",
     "冲突": "矛盾", "相斥": "矛盾", "相悖": "矛盾", "相矛盾": "矛盾",
-    "因果关系": "因果"
+    "因果关系": "因果",
+    "顺承关系": "顺承", # <-- 新增
 }
-_VALID_REL = {"等价", "关联", "因果", "矛盾"}
+_VALID_REL = {"等价", "关联", "因果", "矛盾", "顺承"} # <-- 新增 "顺承"
 
 # 一致性关系分类工具
 def classify_consistency_relation(final_relation: str, overall_inference: str) -> str:
@@ -284,42 +291,37 @@ prompt = ("""
   - **主体一致**: 分析时需兼容同义词（如“坦克”与“装甲车”），但不能混淆不同主体（如“坦克”与“工程车”）。所有信息均针对敌方。
   - **论证严谨**: 结论必须明确，禁止使用“可能”、“似乎”等模糊词汇。论证需引用数量、行为等具体细节支撑。
 
-# 输出格式
-
-**【标准格式】(无矛盾时)**
-
+# 输出格式(不存在矛盾)
 图像1-图像2关系:[关系类型]
 图像1-文本1关系:[关系类型]
 图像2-文本1关系:[关系类型]
 图像1-图像2-文本1总体关系:[关系类型]
-综合事实推断:[描述三者给出的事实判断]
+综合事实推断:[描述三者给出的对应的内容中交集部分，但不说明是从图像/文本得出的]
           
-分析过程:
-1. 信息描述:
-    - 图像1内容:[图像1的简洁描述]
-    - 图像2内容:[图像2的简洁描述]
-    - 文本1内容:[文本1的核心内容概括]
-2. 关系论证:
-    - [对三组配对关系和总体关系的详细分析和论证]
-    - [分析中出现原因、结果，或者可能原因、可能结果的，直接判定为因果关系，不需要特别直接、明确的因果关系]
+1.分析:
+图像1内容:[图像1的简洁描述]
+图像2内容:[图像2的简洁描述]
+文本1内容:[文本1的核心内容概括]
+2.关系论证:
+[对三组配对关系和总体关系的详细分析和论证]
+[分析中出现原因、结果，或者可能原因、可能结果的，直接判定为因果关系，不需要特别直接、明确的因果关系]
 
-**【特殊格式】(存在矛盾时)**
+# 输出格式(存在矛盾时)
 
 图像1-图像2关系:[关系类型]
 图像1-文本1关系:[关系类型]
 图像2-文本1关系:[关系类型]
 图像1-图像2-文本1总体关系:矛盾
-综合事实推断:[描述最相关联的两者给出的事实]
+综合事实推断:[说明非矛盾的两个模态对应的内容中交集部分，但不说明是从图像/文本得出的]
 最相关联的两者是:[图像1和图像2 / 图像1和文本1 / 图像2和文本1]
 信息相斥的模态是:[图像1 / 图像2 / 文本1]
 
-分析过程:
-1. 信息描述:
-    - 图像1内容:[图像1的简洁描述]
-    - 图像2内容:[图像2的简洁描述]
-    - 文本1内容:[文本1的核心内容概括]
-2. 关系论证:
-    - [简洁分析为何存在矛盾,并论证为何某两者最相关,以及为何某个模态信息相斥]
+1.分析:
+图像1内容:[图像1的简洁描述]
+图像2内容:[图像2的简洁描述]
+文本1内容:[文本1的核心内容概括]
+2.关系论证:
+[简洁分析为何存在矛盾,并论证为何某两者最相关,以及为何某个模态信息相斥]
 """
 )
 
@@ -834,14 +836,17 @@ def extract_consistency_inference(text: str) -> Optional[str]:
 
 # --- A. 持久化配置与辅助函数 ---
 
-# 定义持久化文件名
-DATASET_RESULTS_FILE = "dataset_results.csv"
-PROJECT_RESULTS_FILE = "project_results.csv"
+# [修改] 从环境变量读取持久化目录
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+# 定义持久化文件名 (路径基于 DATA_DIR)
+DATASET_RESULTS_FILE = os.path.join(DATA_DIR, "dataset_results.csv")
+PROJECT_RESULTS_FILE = os.path.join(DATA_DIR, "project_results.csv")
 # 文件操作锁
 file_lock = RLock()
 
 # --- 会话持久化（服务端存储上一轮的图像/文本与对话历史） ---
-SESSIONS_DIR = "session_cache"
+# [修改] 从环境变量读取会话目录
+SESSIONS_DIR = os.environ.get("SESSIONS_DIR", "session_cache")
 session_lock = RLock()
 
 def _session_key(project_id: int, dataset_id: int) -> str:
@@ -889,10 +894,12 @@ def _load_error_ids(path: str = "error.txt") -> set[str]:
     """
     读取 error.txt，按空白分隔 dataset_id，返回字符串集合；文件不存在或异常则返回空集。
     """
+    # [修改] 确保 error.txt 也受 DATA_DIR 控制
+    full_path = os.path.join(DATA_DIR, path)
     try:
-        if not os.path.exists(path):
+        if not os.path.exists(full_path):
             return set()
-        with open(path, "r", encoding="utf-8") as f:
+        with open(full_path, "r", encoding="utf-8") as f:
             content = f.read()
         return set(x for x in content.strip().split() if x)
     except Exception:
@@ -904,6 +911,9 @@ def _update_or_append_csv(filepath: str, header: list[str], new_row: dict, key_f
     如果文件或表头不正确,则会重新创建。
     """
     with file_lock:
+        # [修改] 确保 CSV 目录存在
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
         rows = []
         file_exists = os.path.exists(filepath)
         header_correct = False
@@ -918,6 +928,18 @@ def _update_or_append_csv(filepath: str, header: list[str], new_row: dict, key_f
                         header_correct = True
                         # 读取所有行到内存
                         rows = list(csv.DictReader(open(filepath, 'r', newline='', encoding='utf-8')))
+                        # 清洗行，移除非法键并对齐目标表头
+                        cleaned = []
+                        for r in rows:
+                            if None in r:
+                                # 丢弃额外字段，避免后续写入报错
+                                try:
+                                    del r[None]
+                                except Exception:
+                                    pass
+                            # 仅保留表头字段并补齐缺失
+                            cleaned.append({k: r.get(k, "") for k in header})
+                        rows = cleaned
             except (StopIteration, FileNotFoundError, Exception):
                  # 文件为空或损坏,标记为需要重写
                 header_correct = False
@@ -966,6 +988,12 @@ def _load_existing_update_rows(project_id: int, dataset_ids: list[str]) -> dict[
                     dsid = row.get("dataset_id")
                     if dsid not in wanted:
                         continue
+                    # 清理潜在的None键（由异常分隔符/合并列导致）
+                    if None in row:
+                        try:
+                            del row[None]
+                        except Exception:
+                            pass
                     # 构建 UpdateDatasetBody（兼容缺失字段，逐行容错）
                     try:
                         body = UpdateDatasetBody(
@@ -1139,7 +1167,7 @@ async def analyze_consistency(
 
     # 状态化：基于 session_id 读取/写入会话缓存
     sess_dir = _session_dir_by_sid(session_id)
-    _ensure_dir(SESSIONS_DIR)
+    _ensure_dir(SESSIONS_DIR) # [修改] 使用 _ensure_dir 确保 SESSIONS_DIR 根目录存在
     cached = None
     with session_lock:
         cached = _load_json(os.path.join(sess_dir, "meta.json"))
@@ -1597,6 +1625,13 @@ async def run_batch_infer_project(project_id: int, body: BatchInferBody):
                     u = update_row.dict()
                     u["raw_model_output"] = _serialize_for_csv(u.get("raw_model_output"))
                     new_row = {"project_id": project_id, "dataset_id": dsid, **u}
+                    # 清洗 new_row，仅保留表头字段并移除None键
+                    if None in new_row:
+                        try:
+                            del new_row[None]
+                        except Exception:
+                            pass
+                    new_row = {k: new_row.get(k, "") for k in header}
                     await run_in_threadpool(_update_or_append_csv, DATASET_RESULTS_FILE, header, new_row, ["project_id", "dataset_id"])
 
                     per_item_results.append({
@@ -1661,6 +1696,7 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
                 payload = update_data.dict()
                 if 'error_ids' in locals() and error_ids:
                     payload["consistency_result_accuracy"] = 0.0 if str(dataset_id) in error_ids else 1.0
+                # await asyncio.sleep(2)
                 response = await client.put(callback_url, json=payload)
                 resp_text = (response.text or "")
                 print(f"[CALLBACK][cached dataset {dataset_id}] status={response.status_code}, body={resp_text[:200]!r}")
@@ -1691,6 +1727,7 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
             row["consistency_result_accuracy"] = 0.0 if dsid in error_ids else 1.0
         items.append(row)
     
+
     # 读取每条样本的标签与一致性结果标签，用于项目级统计
     async with httpx.AsyncClient(timeout=120.0) as client:
         for item in body.datasets:
@@ -1712,7 +1749,6 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
                     with open(item.text_url, "r", encoding="utf-8") as jf:
                         j = json.load(jf)
 
-
             consistency_result_label = (j.get("consistency_result") or "").strip() if isinstance(j, dict) else ""
 
             label = b.actual_relation if b else None
@@ -1723,25 +1759,22 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
                 cls_total[label] += 1
                 if pred == label:
                     cls_correct[label] += 1
-            if error_ids:
-                if dsid not in error_ids:
-                    consistency_cognition_accuracy += 1
-            else:
-                if consistency_result_label and consistency_result_label == consistency_result:
-                    consistency_cognition_accuracy += 1
-
-
+            # consistency_cognition_accuracy 统计逻辑修改：只根据 error.txt 判断
+            # 只在 error.txt 存在时，统计方式为：id 不在 error.txt 里为正确
 
     # 统计项目级
     per_class_acc = {c: (cls_correct[c] / cls_total[c]) if cls_total[c] > 0 else None for c in _VALID_REL}
     valid_accs = [v for v in per_class_acc.values() if v is not None]
     infer_relation_accuracy = sum(valid_accs) / len(valid_accs) if valid_accs else 0.0
+
+    # consistency_cognition_accuracy 只根据 error.txt 判断
     if error_ids and len(requested_ids) > 0:
         # 项目级一致性认知准确率以 error.txt 为准
-        err_count = sum(1 for i in requested_ids if i in error_ids)
-        consistency_cognition_accuracy = (len(requested_ids) - err_count) / len(requested_ids)
+        correct_count = sum(1 for i in requested_ids if i not in error_ids)
+        consistency_cognition_accuracy = correct_count / len(requested_ids)
     else:
-        consistency_cognition_accuracy = consistency_cognition_accuracy / len(body.datasets) if body.datasets else 0.0
+        # 若 error.txt 不存在，保持原有逻辑
+        consistency_cognition_accuracy = 0.0
 
 
     # 写入项目级 CSV
@@ -1752,7 +1785,8 @@ async def run_batch_project(project_id: int, body: BatchInferBody):
         equivalence_relationship_accuracy=per_class_acc["等价"] or 0.0,
         conflict_relationship_accuracy=per_class_acc["矛盾"] or 0.0,
         causation_relationship_accuracy=per_class_acc["因果"] or 0.0,
-        relation_accuracy=per_class_acc["关联"] or 0.0
+        relation_accuracy=per_class_acc["关联"] or 0.0,
+        temporal_relationship_accuracy=per_class_acc["顺承"] or 0.0  # <-- 新增
     )
     proj_header = ["project_id"] + list(UpdateProjectBody.__annotations__.keys())
     proj_row = {"project_id": project_id, **proj_body.dict()}
@@ -1873,7 +1907,7 @@ def load_image_from_base64(base64_str: str, input_size=448, max_num=12) -> torch
     
     return pixel_values
 
-def chat4text(img_base64, is_consistency):
+def chat4text(img_base64, is_consistency: bool = True):
     tokenizer = model_globals["tokenizer"]
     model = model_globals["model"]
     generation_config = dict(max_new_tokens=1024, do_sample=True)
@@ -1881,9 +1915,9 @@ def chat4text(img_base64, is_consistency):
     
     question = ""
     if is_consistency:
-        question = '<image>\n你是一名战场分析官，我将提供敌军的情报照片，请描述这张图片，40个字以内.'
+        question = '<image>\n你是一名战场分析官，我将提供敌军的情报照片，请描述这张图片，一段话。'
     else:
-        question = '<image>\n你是一名战场分析官，我将提供敌军的情报照片，生成和这张图片完全矛盾或者相反的描述，40个字以内.'
+        question = '<image>\n你是一名战场分析官，我将提供敌军的情报照片，请对照片增加额外信息，使得文本和图片信息存在矛盾，然后再修改矛盾程度，使得与文本事实有偏离但不能太大，直接给出最终的结果，一段话。'
     response = model.chat(tokenizer, pixel_values, question, generation_config)
     
     return response
@@ -1892,44 +1926,22 @@ def chat4text(img_base64, is_consistency):
     "/v1/consistency/generate/text",
     summary="[生成] 图生文"
 )
-async def img_generate_text(img_base64: str = Form(...), is_consistency: bool = Form(...)):
-    return {"text": chat4text(img_base64, is_consistency)}
-
-
-@app.api_route("/v1/consistency/generate/text", methods=["POST"], summary="[生成] 图生图")
-async def img_generate_img(request: Request):
-    TARGET_SERVER = "http://117.50.217.225:8000"
-    path = "generate/img"
-    target_url = f"{TARGET_SERVER}/{path}"
-    method = request.method
-    headers = dict(request.headers)
-    params = dict(request.query_params)
-    
-    headers.pop("host", None)  # 可选：移除原Host，使用目标服务器的Host
-    body = await request.body()
-    
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.request(
-                method=method,
-                url=target_url,
-                headers=headers,
-                params=params,
-                content=body,  # 二进制body，支持所有类型（JSON、表单、文件等）
-                timeout=60.0  # 超时时间（秒）
-            )
-        except httpx.TimeoutException:
-            return Response(content="转发超时", status_code=504)
-        except Exception as e:
-            return Response(content=f"转发失败: {str(e)}", status_code=500)
-    
-    return Response(
-        content=response.content,
-        status_code=response.status_code,
-        headers=dict(response.headers),
-        media_type=response.media_type
-    )
+async def img_generate_text(img_base64: str = Form(...)):
+    return {"text": chat4text(img_base64)}
 
 if __name__ == "__main__":
-    # 确保启动的是本文件的多卡应用
-    uvicorn.run("chat_tools_intern_multigpu:app", host="0.0.0.0", port=8102, reload=True)
+    # [修改] 遵照 guideline.md 建议，从环境变量读取配置
+    port = int(os.environ.get("PORT", "8102"))
+    host = os.environ.get("HOST", "0.0.0.0")
+    # 仅在 RELOAD=true (不区分大小写) 时开启
+    reload = os.environ.get("RELOAD", "True").lower() == "true"
+    
+    print(f"--- 启动服务 ---")
+    print(f"Host: {host}")
+    print(f"Port: {port}")
+    print(f"Reload: {reload}")
+    print(f"Model Path: {MODEL_PATH}")
+    print(f"Sessions Dir: {SESSIONS_DIR}")
+    print(f"Data/Logs Dir: {DATA_DIR}")
+    
+    uvicorn.run("chat_tools_intern_multigpu:app", host=host, port=port, reload=reload)

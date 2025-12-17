@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  multimodal-service:
+    container_name: multimodal_service
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # 自动重启策略 (可选)
+    restart: unless-stopped
+    # 网络端口映射
+    ports:
+      - "${PORT:-8102}:8102"
+    # 挂载宿主机目录到容器
+    volumes:
+      # 1. 挂载模型权重 (关键)：将宿主机模型目录映射到容器内的 /model
+      # 请修改左侧路径为宿主机实际存放 InternVL3_5-14B 的路径
+      # - /path/to/your/model/InternVL3_5-14B:/model/InternVL3_5-14B
+      
+      # 2. 挂载会话缓存：确保重启容器后会话不丢失
+      - ./session_cache:/app/session_cache
+      
+      # 3. 挂载数据/日志目录
+      - ./data:/app/data
+      
+      # 4. (可选) 挂载 logs 目录，如果您的代码有写 .log 文件
+      - ./logs:/app/logs
+    
+    # 环境变量配置
+    environment:
+      # 覆盖 .env 中的 MODEL_PATH，指向容器内部路径
+      - MODEL_PATH=/model/InternVL3_5-14B
+      - SESSIONS_DIR=/app/session_cache
+      - DATA_DIR=/app/data
+      # 传递其他配置
+      - PORT=8102
+      - HF_DEVICE_MAP=balanced
+      - GPU_MEM_FRACTION=1.0
+      - RELOAD=False
+      # 时区
+      - TZ=Asia/Shanghai
+    
+    # 读取 .env 文件中的其他默认值
+    env_file:
+      - .env
+
+    # 资源限制与 GPU 配置
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all # 使用所有 GPU
+              capabilities: [gpu]
+    
+    # 共享内存配置 (深度学习必须)
+    # 避免 DataLoader worker 进程崩溃 (Bus error)
+    ipc: host
+    # 或者使用 shm_size: '16gb'
