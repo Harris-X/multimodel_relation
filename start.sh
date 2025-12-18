@@ -111,7 +111,22 @@ case "$ACTION" in
         mkdir -p $EXPORT_DIR
         docker save -o "$EXPORT_DIR/$TAR_NAME" $IMAGE_NAME
         
-        echo "[SUCCESS] 构建完成！交付文件位于: $EXPORT_DIR/$TAR_NAME"
+        echo "[INFO] 正在复制配置文件到 $EXPORT_DIR..."
+        cp start.sh "$EXPORT_DIR/"
+        # 优先复制 .env，如果不存在则复制 .env.example
+        if [ -f .env ]; then
+            cp .env "$EXPORT_DIR/"
+        elif [ -f .env.example ]; then
+            cp .env.example "$EXPORT_DIR/.env"
+        fi
+        # 复制说明文档
+        [ -f deploy.md ] && cp deploy.md "$EXPORT_DIR/"
+        # 复制构建与编排文件
+        [ -f docker-compose.yml ] && cp docker-compose.yml "$EXPORT_DIR/"
+        [ -f Dockerfile ] && cp Dockerfile "$EXPORT_DIR/"
+        [ -f requirements.txt ] && cp requirements.txt "$EXPORT_DIR/"
+        
+        echo "[SUCCESS] 构建完成！交付文件位于: $EXPORT_DIR"
         ;;
 
     "run"|"run:nogpu")
