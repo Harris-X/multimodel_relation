@@ -43,8 +43,12 @@ case "$ACTION" in
         echo "[INFO] === 开始安装流程 ==="
         
         # 场景 A: 生产环境导入 Docker 镜像
-        if [ -f "$EXPORT_DIR/$TAR_NAME" ]; then
-            echo "[INFO] 检测到离线镜像包，正在导入 Docker 镜像..."
+        if [ -f "$TAR_NAME" ]; then
+            echo "[INFO] 检测到当前目录下存在离线镜像包，正在导入 Docker 镜像..."
+            docker load -i "$TAR_NAME"
+            echo "[SUCCESS] 镜像导入完成。"
+        elif [ -f "$EXPORT_DIR/$TAR_NAME" ]; then
+            echo "[INFO] 检测到离线镜像包 ($EXPORT_DIR)，正在导入 Docker 镜像..."
             docker load -i "$EXPORT_DIR/$TAR_NAME"
             echo "[SUCCESS] 镜像导入完成。"
         
@@ -91,40 +95,59 @@ case "$ACTION" in
 
     "build")
         echo "[INFO] === 开始构建流程 ==="
+        mkdir -p $EXPORT_DIR
         
-        # 检查基础镜像是否存在，不存在则尝试拉取
-        if ! docker image inspect $BASE_IMAGE > /dev/null 2>&1; then
-            echo "[INFO] 本地未找到基础镜像 $BASE_IMAGE，尝试拉取..."
-            docker pull $BASE_IMAGE
-            if [ $? -ne 0 ]; then
-                echo "[ERROR] 无法拉取基础镜像。如果您在中国大陆，可能需要配置 Docker 镜像加速。"
-                echo "建议: 1. 配置 /etc/docker/daemon.json 使用镜像加速器"
-                echo "      2. 或者修改脚本中的 BASE_IMAGE 变量为可访问的镜像源"
-                exit 1
-            fi
+        # 检查是否需要重新构建
+        DO_BUILD=true
+        if [ -f "$EXPORT_DIR/$TAR_NAME" ]; then
+            read -p "[QUESTION] 镜像包 $EXPORT_DIR/$TAR_NAME 已存在。是否重新构建镜像？(默认 N) [y/N]: " REBUILD_CHOICE
+            case "$REBUILD_CHOICE" in 
+                [yY][eE][sS]|[yY]) 
+                    DO_BUILD=true 
+                    ;;
+                *) 
+                    DO_BUILD=false 
+                    echo "[INFO] 跳过镜像构建与导出，仅更新配置文件..." 
+                    ;;
+            esac
         fi
 
-        echo "[INFO] 构建 Docker 镜像: $IMAGE_NAME (Base: $BASE_IMAGE)"
-        docker build --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE_NAME .
-        
-        echo "[INFO] 正在导出镜像到 $EXPORT_DIR (这可能需要几分钟)..."
-        mkdir -p $EXPORT_DIR
-        docker save -o "$EXPORT_DIR/$TAR_NAME" $IMAGE_NAME
+        if [ "$DO_BUILD" = "true" ]; then
+            # 检查基础镜像是否存在，不存在则尝试拉取
+            if ! docker image inspect $BASE_IMAGE > /dev/null 2>&1; then
+                echo "[INFO] 本地未找到基础镜像 $BASE_IMAGE，尝试拉取..."
+                docker pull $BASE_IMAGE
+                if [ $? -ne 0 ]; then
+                    echo "[ERROR] 无法拉取基础镜像。如果您在中国大陆，可能需要配置 Docker 镜像加速。"
+                    echo "建议: 1. 配置 /etc/docker/daemon.json 使用镜像加速器"
+                    echo "      2. 或者修改脚本中的 BASE_IMAGE 变量为可访问的镜像源"
+                    exit 1
+                fi
+            fi
+
+            echo "[INFO] 构建 Docker 镜像: $IMAGE_NAME (Base: $BASE_IMAGE)"
+            docker build --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE_NAME .
+            
+            echo "[INFO] 正在导出镜像到 $EXPORT_DIR (这可能需要几分钟)..."
+            docker save -o "$EXPORT_DIR/$TAR_NAME" $IMAGE_NAME
+        fi
         
         echo "[INFO] 正在复制配置文件到 $EXPORT_DIR..."
-        cp start.sh "$EXPORT_DIR/"
-        # 优先复制 .env，如果不存在则复制 .env.example
-        if [ -f .env ]; then
+        # 强制更新脚本和文档，确保交付版本一致
+        cp -f start.sh "$EXPORT_DIR/"
+        [ -f deploy.md ] && cp -f deploy.md "$EXPORT_DIR/"
+        [ -f docker-compose.yml ] && cp -f docker-compose.yml "$EXPORT_DIR/"
+        [ -f Dockerfile ] && cp -f Dockerfile "$EXPORT_DIR/"
+        [ -f requirements.txt ] && cp -f requirements.txt "$EXPORT_DIR/"
+
+        # 特殊处理 .env：如果目标目录已有 .env，则不覆盖，防止丢失生产配置
+        if [ -f "$EXPORT_DIR/.env" ]; then
+            echo "[WARN] 目标目录已存在 .env 文件，跳过覆盖以保留现有配置。"
+        elif [ -f .env ]; then
             cp .env "$EXPORT_DIR/"
         elif [ -f .env.example ]; then
             cp .env.example "$EXPORT_DIR/.env"
         fi
-        # 复制说明文档
-        [ -f deploy.md ] && cp deploy.md "$EXPORT_DIR/"
-        # 复制构建与编排文件
-        [ -f docker-compose.yml ] && cp docker-compose.yml "$EXPORT_DIR/"
-        [ -f Dockerfile ] && cp Dockerfile "$EXPORT_DIR/"
-        [ -f requirements.txt ] && cp requirements.txt "$EXPORT_DIR/"
         
         echo "[SUCCESS] 构建完成！交付文件位于: $EXPORT_DIR"
         ;;
