@@ -160,7 +160,15 @@ case "$ACTION" in
             echo "[INFO] 模式: Docker 容器运行"
             
             # GPU 参数处理
-            GPU_FLAG="--gpus all"
+            if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+                # 将 0,1 转换为 device=0,1 格式
+                GPU_FLAG="--gpus \"device=$CUDA_VISIBLE_DEVICES\""
+                echo "[INFO] 检测到指定 GPU: $CUDA_VISIBLE_DEVICES (Docker 参数: $GPU_FLAG)"
+            else
+                GPU_FLAG="--gpus all"
+                echo "[INFO] 未指定 GPU，容器将使用所有可用 GPU (--gpus all)"
+            fi
+
             if [ "$ACTION" == "run:nogpu" ]; then
                 echo "[WARN] 警告: 未启用 GPU，推理速度将极慢"
                 GPU_FLAG=""
@@ -224,18 +232,39 @@ case "$ACTION" in
             fi
             
             echo "[INFO] 启动 FastAPI 服务..."
-            export CUDA_VISIBLE_DEVICES=0 
+            # 如果环境变量未设置，默认使用 0
+            export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+            echo "[INFO] 本地运行使用 GPU: $CUDA_VISIBLE_DEVICES"
             python chat_tools_intern_multigpu.py
+        fi
+        ;;
+
+    "stop")
+        echo "[INFO] === 停止服务流程 ==="
+        
+        # 1. 停止 Docker 容器
+        docker rm -f $CONTAINER_NAME >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            echo "[SUCCESS] 已停止并删除 Docker 容器: $CONTAINER_NAME"
+        else
+            echo "[INFO] 未发现运行中的 Docker 容器。"
+        fi
+
+        # 2. 停止本地 Python 进程
+        # 查找包含 chat_tools_intern_multigpu.py 的进程，排除 grep 自身
+        PIDS=$(ps -ef | grep "chat_tools_intern_multigpu.py" | grep -v grep | awk '{print $2}')
+        if [ -n "$PIDS" ]; then
+            echo "[INFO] 发现本地 Python 服务进程 (PID: $PIDS)，正在停止..."
+            # shellcheck disable=SC2086
+            kill -9 $PIDS
+            echo "[SUCCESS] 本地服务已停止。"
+        else
+            echo "[INFO] 未发现本地运行的服务进程。"
         fi
         ;;
 
     *)
         show_help
         exit 1
-        ;;
-
-    "stop")
-        echo "[INFO] 停止并清理容器: $CONTAINER_NAME"
-        docker rm -f $CONTAINER_NAME 2>/dev/null && echo "[SUCCESS] 已停止并删除容器。" || echo "[WARN] 未找到正在运行的容器，无需处理。"
         ;;
 esac
