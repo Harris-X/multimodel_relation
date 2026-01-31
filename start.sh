@@ -22,12 +22,14 @@ PORT=${PORT:-8102}
 
 # 帮助函数
 function show_help {
-    echo "用法: $0 {install|run|run:nogpu|build|stop}"
+    echo "用法: $0 {install|run|run:nogpu|build|stop|cli}"
     echo "  install   : 安装依赖 (自动识别离线/在线模式)"
     echo "  run       : 启动服务 (优先使用 Docker，无镜像则使用本地 Python)"
     echo "  build     : 构建并导出 Docker 镜像 (用于交付)"
     echo "  run:nogpu : (仅调试) 不使用 GPU 启动 Docker"
     echo "  stop      : 停止并删除已运行的 Docker 容器"
+    echo "  cli MODE  : 在容器或本地运行 CLI 脚本 (MODE=conflict|consistency|relation)"
+    echo "              支持位置参数调用: $0 cli consistency <rgb> <ir> <text>"
     echo "环境变量: USE_HOST_MODEL=true 时挂载宿主机模型目录 (使用 .env 中的 MODEL_PATH)"
 }
 
@@ -139,6 +141,7 @@ case "$ACTION" in
         [ -f docker-compose.yml ] && cp -f docker-compose.yml "$EXPORT_DIR/"
         [ -f Dockerfile ] && cp -f Dockerfile "$EXPORT_DIR/"
         [ -f requirements.txt ] && cp -f requirements.txt "$EXPORT_DIR/"
+        ls relation_cli_*.py >/dev/null 2>&1 && cp -f relation_cli_*.py "$EXPORT_DIR/"
 
         # 特殊处理 .env：如果目标目录已有 .env，则不覆盖，防止丢失生产配置
         if [ -f "$EXPORT_DIR/.env" ]; then
@@ -260,6 +263,65 @@ case "$ACTION" in
             echo "[SUCCESS] 本地服务已停止。"
         else
             echo "[INFO] 未发现本地运行的服务进程。"
+        fi
+        ;;
+
+    "cli")
+        # 用法: ./start.sh cli conflict --rgb_image_url ...
+        shift
+        CLI_MODE=$1
+        shift || true
+
+        case "$CLI_MODE" in
+            "conflict") CLI_SCRIPT="relation_cli_conflict.py" ;;
+            "consistency") CLI_SCRIPT="relation_cli_consistency.py" ;;
+            "relation") CLI_SCRIPT="relation_cli_relation.py" ;;
+            ""|*)
+                echo "[ERROR] CLI 模式缺失或不支持。用法: $0 cli {conflict|consistency|relation} <args>";
+                exit 1
+                ;;
+        esac
+
+        # 保持与 run 逻辑一致的 GPU/模型挂载处理
+        if docker image inspect $IMAGE_NAME > /dev/null 2>&1; then
+            if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+                GPU_FLAG="--gpus \"device=$CUDA_VISIBLE_DEVICES\""
+                echo "[INFO] CLI 使用指定 GPU: $CUDA_VISIBLE_DEVICES"
+            else
+                GPU_FLAG="--gpus all"
+                echo "[INFO] CLI 未指定 GPU，默认使用全部 GPU"
+            fi
+
+            MOUNT_MODEL=""
+            if [ "$USE_HOST_MODEL" = "true" ]; then
+                if [ -z "$MODEL_PATH" ]; then
+                    echo "[ERROR] USE_HOST_MODEL=true 但 .env 中未设置 MODEL_PATH"; exit 1; fi
+                if [ ! -d "$MODEL_PATH" ]; then
+                    echo "[ERROR] 宿主机模型路径不存在: $MODEL_PATH"; exit 1; fi
+                echo "[INFO] 挂载宿主机模型: $MODEL_PATH -> $MODEL_PATH_IN_CONTAINER"
+                MOUNT_MODEL="-v \"$MODEL_PATH\":$MODEL_PATH_IN_CONTAINER"
+            else
+                echo "[INFO] 使用镜像内置模型"
+            fi
+
+            # 挂载常用目录以便读取输入/输出
+            mkdir -p session_cache data
+            docker run --rm \
+                $GPU_FLAG \
+                --env-file .env \
+                -e MODEL_PATH=$MODEL_PATH_IN_CONTAINER \
+                -v $(pwd)/session_cache:/app/session_cache \
+                -v $(pwd)/data:/app/data \
+                -v $(pwd):/workspace \
+                ${MOUNT_MODEL} \
+                $IMAGE_NAME \
+                python $CLI_SCRIPT "$@"
+        else
+            echo "[INFO] 未检测到 Docker 镜像，回退到本地运行"
+            if [ -d "venv" ]; then
+                source venv/bin/activate
+            fi
+            python $CLI_SCRIPT "$@"
         fi
         ;;
 

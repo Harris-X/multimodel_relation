@@ -7,6 +7,7 @@
 确保您的项目根目录包含以下文件：
 
   * [cite_start]`chat_tools_intern_multigpu.py` [cite: 3]
+    * `relation_cli_common.py`, `relation_cli_conflict.py`, `relation_cli_consistency.py`, `relation_cli_relation.py`
   * [cite_start]`.env` (由 `.env.example` 复制而来) [cite: 4]
   * [cite_start]`Dockerfile` [cite: 1]
 
@@ -245,6 +246,27 @@ esac
     ./start.sh run
     ```
     *预期结果*：服务通过本地 Python 启动，访问 `http://IP:8102/docs` 可见 Swagger UI。
+
+#### 使用 CLI 模式进行离线推理
+
+在构建好的镜像或本地环境中，可直接通过 `start.sh cli` 调用四个命令行脚本：
+
+```bash
+# 示例：判定冲突（使用命名参数）
+./start.sh cli conflict --rgb_image_url /workspace/data/rgb.jpg --infrared_image_url /workspace/data/ir.jpg --text_json_url /workspace/data/text.json
+
+# 示例：输出一致性结果（使用位置参数，等价于 python relation_cli_consistency.py <rgb> <ir> <text>）
+./start.sh cli consistency /workspace/data/rgb.jpg /workspace/data/ir.jpg /workspace/data/text.json
+
+# 示例：仅输出关系（位置参数）
+./start.sh cli relation /workspace/data/rgb.jpg /workspace/data/ir.jpg /workspace/data/text.json
+```
+
+说明：
+
+- `start.sh cli` 会优先在 Docker 镜像中运行脚本；若未检测到镜像则回退到本地 Python 运行。
+- 脚本会挂载当前目录到容器内的 `/workspace`，请使用 `/workspace/...` 形式访问宿主机文件；`./data` 与 `./session_cache` 会分别映射为 `/app/data` 与 `/app/session_cache`。
+- 当 `USE_HOST_MODEL=true` 时会把 `.env` 中的 `MODEL_PATH` 挂载到容器内的 `$MODEL_PATH_IN_CONTAINER`。
 
 #### 2\. 离线打包 (Build & Export)
 

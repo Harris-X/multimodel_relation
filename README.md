@@ -10,7 +10,7 @@
 
 ## 2. 技术栈
 
-* **Python**: 3.12
+* **Python**: 3.10
 * **Web框架**: FastAPI, Uvicorn
 * **AI模型**: PyTorch, Transformers (Hugging Face)
 * **模型**: InternVL3_5-14B

@@ -11,7 +11,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # 设置时区为上海，方便日志查看
     TZ=Asia/Shanghai \
     # 镜像内置模型路径（默认已拷贝 InternVL3_5-14B-Instruct）
-    MODEL_PATH=/model/InternVL3_5-14B
+    MODEL_PATH=/model/InternVL3_5-14B \
+    # HuggingFace 国内镜像
+    HF_ENDPOINT=https://hf-mirror.com
 
 # 设置工作目录
 WORKDIR /app
@@ -70,8 +72,9 @@ RUN python -m pip install --upgrade pip && \
     fi
 
 # 3. 复制项目代码与模型权重（将 InternVL3_5-14B-Instruct 打包进镜像）
-COPY chat_tools_intern_multigpu.py .
-COPY .env.example .
+COPY chat_tools_intern_multigpu.py ./
+COPY relation_cli_common.py relation_cli_conflict.py relation_cli_consistency.py relation_cli_relation.py ./
+COPY .env.example ./
 COPY InternVL3_5-14B-Instruct /model/InternVL3_5-14B
 
 # 4. 创建必要的目录 (避免运行时权限问题)
