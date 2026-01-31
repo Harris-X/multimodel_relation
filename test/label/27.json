@@ -1,0 +1,11 @@
+{
+  "conflict_label_rgb1_rgb2": "否",
+  "conflict_label_rgb1_text1": "否",
+  "conflict_label_rgb2_text1": "否",
+  "conflict_final_conflict": "否",
+  "consistency_result": "一致",
+  "relation_label_rgb1_rgb2": "等价",
+  "relation_label_rgb1_text1": "等价",
+  "relation_label_rgb2_text1": "等价",
+  "relation_final_relation": "等价"
+}

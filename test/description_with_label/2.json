@@ -1,0 +1,9 @@
+{
+  "label": "因果",
+  "error": "",
+  "text": "森林据点暴露，吸引探查。",
+  "msg": "密级：机密\n\n等级：紧急\n\n时间：2023-10-05\n\n发报：情报分析处\n\n收报：作战指挥中心\n\n抄送：无\n\n主题：前线侦察报告\n\n正文：森林据点暴露，吸引探查。\n\n完毕。",
+  "rgb_img": "./merge_img/rgb/2.jpg",
+  "infra_img": "./merge_img/thermal/2.jpg",
+  "consistency_result": "敌方士兵在森林中巡逻，可能是由于森林据点暴露，吸引了探查。"
+}
