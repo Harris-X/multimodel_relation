@@ -11,6 +11,8 @@
   * [cite_start]`.env` (由 `.env.example` 复制而来) [cite: 4]
   * [cite_start]`Dockerfile` [cite: 1]
 
+> 提示：Docker 镜像现在不再内置模型权重，部署时必须将宿主机的 `InternVL3_5-14B-Instruct` 目录挂载到容器内的 `/model/InternVL3_5-14B-Instruct`；`.env` 中的 `MODEL_PATH` 应填写宿主机真实路径。
+
 #### 2. 下载离线依赖 (使用本地 Pip/Conda)
 
 **注意**：为了确保下载的依赖包与 Docker 内部环境 (Linux + Python 3.12) 兼容，请务必在 **Linux** 环境下使用 **Python 3.12** 进行下载。
@@ -284,8 +286,8 @@ esac
 
 1.  **上传交付物**：将 `docker-images-export` 文件夹、`start.sh` 和 `.env` 上传到生产服务器。
 2.  **配置生产环境**：
-      * 修改 `.env` 中的 `MODEL_PATH` 为生产服务器上模型的路径（例如 `/data/models/InternVL`）。
-      * **注意**：`start.sh` 中的 `docker run` 命令会自动将这个宿主机路径挂载到容器内的 `/models/InternVL3_5-14B`。
+    * 修改 `.env` 中的 `MODEL_PATH` 为生产服务器上模型的路径（例如 `/data/models/InternVL3_5-14B-Instruct`）。
+    * **注意**：镜像未包含模型，`start.sh`（默认 `USE_HOST_MODEL=true`）会将该宿主机路径挂载为容器内的 `/model/InternVL3_5-14B-Instruct` 并在容器中使用该路径进行加载。
 3.  **安装（导入镜像）**：
     ```bash
     ./start.sh install

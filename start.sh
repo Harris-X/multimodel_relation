@@ -5,13 +5,13 @@ IMAGE_NAME="multi_modal_analysis:1.0"
 CONTAINER_NAME="multimodal_service"
 EXPORT_DIR="docker-images-export"
 TAR_NAME="multi_modal_analysis_1.0.tar"
-# 是否强制使用宿主机模型路径挂载（默认 false，使用镜像内置模型）
-USE_HOST_MODEL=${USE_HOST_MODEL:-false}
-# 容器内模型默认路径（镜像已内置）
-MODEL_PATH_IN_CONTAINER="/model/InternVL3_5-14B"
+# 是否强制使用宿主机模型路径挂载（镜像不再内置模型，默认 true）
+USE_HOST_MODEL=${USE_HOST_MODEL:-true}
+# 容器内模型路径（仅通过挂载提供）
+MODEL_PATH_IN_CONTAINER="/model/InternVL3_5-14B-Instruct"
 # 基础镜像 (如果 Docker Hub 无法访问，请修改此处为国内镜像源)
 # 例如: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
-BASE_IMAGE="nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04"
+BASE_IMAGE="nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04"
 # =========================================
 
 # [cite_start]读取 .env 配置 (端口默认 8102) [cite: 1]
@@ -30,7 +30,7 @@ function show_help {
     echo "  stop      : 停止并删除已运行的 Docker 容器"
     echo "  cli MODE  : 在容器或本地运行 CLI 脚本 (MODE=conflict|consistency|relation)"
     echo "              支持位置参数调用: $0 cli consistency <rgb> <ir> <text>"
-    echo "环境变量: USE_HOST_MODEL=true 时挂载宿主机模型目录 (使用 .env 中的 MODEL_PATH)"
+    echo "环境变量: USE_HOST_MODEL=true (默认) 挂载宿主机模型目录，使用 .env 中的 MODEL_PATH"
 }
 
 # 动作分发
@@ -201,7 +201,8 @@ case "$ACTION" in
                 echo "[INFO] 挂载宿主机模型: $MODEL_PATH -> $MODEL_PATH_IN_CONTAINER"
                 MOUNT_MODEL="-v \"$MODEL_PATH\":$MODEL_PATH_IN_CONTAINER"
             else
-                echo "[INFO] 使用镜像内置模型，不挂载宿主机模型目录"
+                echo "[ERROR] 镜像已不包含模型，请设置 USE_HOST_MODEL=true 并确保 .env 中的 MODEL_PATH 指向宿主机模型目录"
+                exit 1
             fi
             
             docker run -d \
@@ -301,7 +302,8 @@ case "$ACTION" in
                 echo "[INFO] 挂载宿主机模型: $MODEL_PATH -> $MODEL_PATH_IN_CONTAINER"
                 MOUNT_MODEL="-v \"$MODEL_PATH\":$MODEL_PATH_IN_CONTAINER"
             else
-                echo "[INFO] 使用镜像内置模型"
+                echo "[ERROR] 镜像已不包含模型，请设置 USE_HOST_MODEL=true 并确保 .env 中的 MODEL_PATH 指向宿主机模型目录"
+                exit 1
             fi
 
             # 挂载常用目录以便读取输入/输出

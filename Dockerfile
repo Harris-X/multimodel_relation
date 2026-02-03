@@ -10,8 +10,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PORT=8102 \
     # 设置时区为上海，方便日志查看
     TZ=Asia/Shanghai \
-    # 镜像内置模型路径（默认已拷贝 InternVL3_5-14B-Instruct）
-    MODEL_PATH=/model/InternVL3_5-14B \
+    # 容器内模型路径（需挂载 InternVL3_5-14B-Instruct 权重）
+    MODEL_PATH=/model/InternVL3_5-14B-Instruct \
     # HuggingFace 国内镜像
     HF_ENDPOINT=https://hf-mirror.com
 
@@ -71,14 +71,13 @@ RUN python -m pip install --upgrade pip && \
         python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --ignore-installed; \
     fi
 
-# 3. 复制项目代码与模型权重（将 InternVL3_5-14B-Instruct 打包进镜像）
+# 3. 复制项目代码（模型权重通过挂载提供）
 COPY chat_tools_intern_multigpu.py ./
 COPY relation_cli_common.py relation_cli_conflict.py relation_cli_consistency.py relation_cli_relation.py ./
 COPY .env.example ./
-COPY InternVL3_5-14B-Instruct /model/InternVL3_5-14B
 
 # 4. 创建必要的目录 (避免运行时权限问题)
-RUN mkdir -p session_cache && chmod 777 session_cache
+RUN mkdir -p /model/InternVL3_5-14B session_cache && chmod 777 session_cache
 
 # 5. 声明端口
 EXPOSE 8102

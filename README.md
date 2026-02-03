@@ -4,7 +4,7 @@
 
 本项目是一个基于 FastAPI 的多模态关系分析算法服务。
 
-它使用 **InternVL3_5-14B** 模型，旨在分析RGB图像（图像1）、红外图像（图像2）和文本（文本1）之间的深层关系。服务能够执行配对分析（如 图像1-图像2）和总体关系判定，输出**等价、关联、因果、矛盾、顺承**五种关系之一，并提供详细的分析论证和综合事实推断。
+它使用 **InternVL3_5-14B-Instruct** 模型，旨在分析RGB图像（图像1）、红外图像（图像2）和文本（文本1）之间的深层关系。服务能够执行配对分析（如 图像1-图像2）和总体关系判定，输出**等价、关联、因果、矛盾、顺承**五种关系之一，并提供详细的分析论证和综合事实推断。
 
 本项目基于 `chat_tools_intern_multigpu.py` 单文件实现，支持多GPU部署、流式（SSE）与非流式API调用，并集成了会话管理和结果持久化（CSV）功能。
 
@@ -13,7 +13,7 @@
 * **Python**: 3.10
 * **Web框架**: FastAPI, Uvicorn
 * **AI模型**: PyTorch, Transformers (Hugging Face)
-* **模型**: InternVL3_5-14B
+* **模型**: InternVL3_5-14B-Instruct
 * **部署**: Docker
 
 ## 3. 系统要求
@@ -21,7 +21,7 @@
 * **硬件**: 一台或多台 NVIDIA GPU（已在 4 卡环境下测试）
 * **操作系统**: Linux
 * **软件**: Python 3.10+, CUDA 12.1+
-* **模型文件**: 需要您自行下载 `InternVL3_5-14B` 模型权重，并在 `.env` 文件中配置其路径。
+* **模型文件**: 需要您自行下载 `InternVL3_5-14B-Instruct` 模型权重，并在 `.env` 文件中配置其路径。Docker 镜像不再内置模型，运行时必须将宿主机模型目录挂载到容器内的 `/model/InternVL3_5-14B`。
 
 ## 4. 如何在本地启动开发
 
@@ -141,7 +141,7 @@ docker build -t multi_modal_analysis:1.0 .
 > **注意**：
 >
 > 1.  确保 `--gpus all` 标志已添加。
-> 2.  确保 `.env` 文件中的 `MODEL_PATH` 指向容器内的挂载路径 (例如 `/models/InternVL3_5-14B`)。
+> 2.  镜像不包含模型权重，必须挂载宿主机模型目录；建议 `.env` 中的 `MODEL_PATH` 填写宿主机真实路径，运行容器时使用 `-e MODEL_PATH=/model/InternVL3_5-14B-Instruct` 覆盖为容器内路径。
 > 3.  确保 `.env` 中的 `RELOAD` 设置为 `False`。
 > 4.  确保 `DATA_DIR` 和 `SESSIONS_DIR` 指向容器内的挂载点 (例如 `/app/data_logs` 和 `/app/session_cache`)。
 
@@ -150,9 +150,10 @@ docker run -d \
     --name multi_modal_service \
     --gpus all \
     -p 8102:8102 \
-    -v /path/on/host/models:/models \
+  -v /path/on/host/InternVL3_5-14B-Instruct:/model/InternVL3_5-14B-Instruct \
     -v /path/on/host/session_cache:/app/session_cache \
     -v /path/on/host/csv_logs:/app/data_logs \
+  -e MODEL_PATH=/model/InternVL3_5-14B-Instruct \
     --env-file ./.env \
     multi_modal_analysis:1.0
 ```
@@ -160,7 +161,7 @@ docker run -d \
 ## 6\. 常见问题 (FAQ)
 
 **Q: 启动时报错 `RuntimeError: 模型路径不存在`**
-A: 请检查您的 `.env` 文件中的 `MODEL_PATH` 是否正确指向了 `InternVL3_5-14B` 模型的权重目录。
+A: 请检查您的 `.env` 文件中的 `MODEL_PATH` 是否正确指向了 `InternVL3_5-14B-Instruct` 模型的权重目录。
 
 **Q: 出现 `torch.cuda.OutOfMemoryError` (OOM)**
 A:
